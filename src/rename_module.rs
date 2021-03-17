@@ -17,7 +17,7 @@ use itertools::{
     EitherOrBoth::*,
 };
 use rayon::prelude::*;
-use crate::ast_util::scopes::{Reference, Variable, ScopeManager};
+use crate::ast_util::scopes::{Variable, ScopeManager};
 use crate::detect;
 use crate::move_module;
 use crate::refactor::{self, RenameResult, TokenCow, Warning};
@@ -56,8 +56,8 @@ impl RenameModuleVisitor {
 
     fn warn_shadowing(&mut self, node: &dyn Node, new_name: String) {
         let mut warn = false;
-        for (scope_id, scope) in &self.scopes.scopes {
-            if let Some(var_id) = self.scopes.variable_in_scope(scope_id, &new_name) {
+        for (scope_id, _) in &self.scopes.scopes {
+            if let Some(_) = self.scopes.variable_in_scope(scope_id, &new_name) {
                 // TODO no way to construct full_moon's Position struct...
                 // self.warnings.push(Warning::new_from_range(self.filepath.clone(), ident_range, format!("Rename now shadows variable previously in scope")));
                 warn = true

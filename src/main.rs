@@ -128,6 +128,40 @@ fn get_root(input_file: &Path) -> Option<PathBuf> {
     None
 }
 
+fn write_code(results: &Vec<refactor::RenameResult<'_>>) -> Result<()> {
+    let pb = ProgressBar::new(results.len() as u64);
+
+    let process = |result: &refactor::RenameResult<'_>| -> Result<()> {
+        if let Some(new_ast) = &result.new_ast {
+            fs::write(&result.filepath, full_moon::print(&new_ast))?;
+        }
+
+        pb.inc(1);
+
+        Ok(())
+    };
+
+    results.par_iter().try_for_each(process)?;
+    pb.finish_with_message("");
+
+    Ok(())
+}
+
+fn print_results(results: &Vec<refactor::RenameResult<'_>>) {
+    let mut updated = 0;
+    let mut warnings = 0;
+    for result in results.iter() {
+        updated += result.renamed_count;
+        warnings += result.warnings.len();
+
+        for warning in &result.warnings {
+            println!("{}", warning);
+        }
+    }
+
+    println!("Made {} changes across {} files with {} warnings.", updated, results.len(), warnings);
+}
+
 fn cmd_rename(sub_matches: &ArgMatches) -> Result<()> {
     let input_file = Path::new(sub_matches.value_of("FILE").unwrap());
     let fn_name = sub_matches.value_of("FN-NAME").unwrap();
@@ -145,31 +179,9 @@ fn cmd_rename(sub_matches: &ArgMatches) -> Result<()> {
 
     println!("Writing code...");
 
-    let pb = ProgressBar::new(results.len() as u64);
+    write_code(&results)?;
 
-    let process = |result: &refactor::RenameResult<'_>| -> Result<()> {
-        if let Some(new_ast) = &result.new_ast {
-            fs::write(&result.filepath, full_moon::print(&new_ast))?;
-        }
-
-        pb.inc(1);
-
-        Ok(())
-    };
-
-    results.par_iter().try_for_each(process)?;
-    pb.finish_with_message("");
-
-    let mut renamed = 0;
-    for result in &results {
-        renamed += result.renamed_count;
-
-        for warning in &result.warnings {
-            println!("{}", warning);
-        }
-    }
-
-    println!("Renamed {} identifiers across {} files.", renamed, results.len());
+    print_results(&results);
 
     Ok(())
 }
@@ -204,36 +216,14 @@ fn cmd_move(sub_matches: &ArgMatches) -> Result<()> {
 
     println!("Writing code...");
 
-    let pb = ProgressBar::new(results.len() as u64);
-
-    let process = |result: &refactor::RenameResult<'_>| -> Result<()> {
-        if let Some(new_ast) = &result.new_ast {
-            fs::write(&result.filepath, full_moon::print(&new_ast))?;
-        }
-
-        pb.inc(1);
-
-        Ok(())
-    };
-
-    results.par_iter().try_for_each(process)?;
-    pb.finish_with_message("");
+    write_code(&results)?;
 
     println!("Performing move...");
 
     fs::copy(input_file, new_path)?;
     fs::remove_file(input_file)?;
 
-    let mut updated = 0;
-    for result in &results {
-        updated += result.renamed_count;
-
-        for warning in &result.warnings {
-            println!("{}", warning);
-        }
-    }
-
-    println!("Updated {} require paths across {} files.", updated, results.len());
+    print_results(&results);
 
     Ok(())
 }
@@ -266,36 +256,14 @@ fn cmd_rename_module(sub_matches: &ArgMatches) -> Result<()> {
 
     println!("Writing code...");
 
-    let pb = ProgressBar::new(results.len() as u64);
-
-    let process = |result: &refactor::RenameResult<'_>| -> Result<()> {
-        if let Some(new_ast) = &result.new_ast {
-            fs::write(&result.filepath, full_moon::print(&new_ast))?;
-        }
-
-        pb.inc(1);
-
-        Ok(())
-    };
-
-    results.par_iter().try_for_each(process)?;
-    pb.finish_with_message("");
+    write_code(&results)?;
 
     println!("Performing move...");
 
     fs::copy(input_file, new_path)?;
     fs::remove_file(input_file)?;
 
-    let mut updated = 0;
-    for result in &results {
-        updated += result.renamed_count;
-
-        for warning in &result.warnings {
-            println!("{}", warning);
-        }
-    }
-
-    println!("Updated {} require paths across {} files.", updated, results.len());
+    print_results(&results);
 
     Ok(())
 }
