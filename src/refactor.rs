@@ -286,14 +286,6 @@ impl VisitorMut<'_> for RenameFnCallVisitor {
                             if fn_name.token().to_string() == self.fn_name {
                                 if let Some(pos) = module_name.start_position() {
                                     let byte_pos = pos.bytes();
-                                    // println!("reference {:?} {}", module_name.range(), byte_pos);
-                                    for (i, r) in &self.scopes.references {
-                                        // println!("ref {:?} {:?}", i, r);
-                                    }
-                                    for (i, v) in &self.scopes.variables {
-                                        // println!("var {:?} {:?}", i, v);
-                                    }
-
                                     if let Some(reference) = self.scopes.reference_at_byte(byte_pos) {
                                         if let Some(resolved_id) = reference.resolved {
                                             if self.referenced_variables.contains(&resolved_id) {
@@ -362,13 +354,17 @@ fn rename_in_file(root: &Path, path: &Path, require_path: &str, module_name: &st
 
 fn is_lua_file(entry: &walkdir::DirEntry) -> bool {
     if entry.file_type().is_dir() {
-        return true
+        return entry.file_name() != "locale"
     }
 
     entry.file_name()
          .to_str()
          .map(|s| s.ends_with(".lua"))
          .unwrap_or(false)
+}
+
+fn is_useful_path(path: &Path) -> bool {
+    return !path.ends_with("src/thirdparty")
 }
 
 pub fn rename_function(root: &Path, path: &Path, fn_name: &str, new_name: &str) -> Result<()> {
@@ -397,8 +393,19 @@ pub fn rename_function(root: &Path, path: &Path, fn_name: &str, new_name: &str) 
     let mut renamed_count = 0;
     let mut warnings = Vec::new();
 
-    let walker = WalkDir::new(root).into_iter();
-    for entry in walker.filter_entry(is_lua_file).filter_map(|e| e.ok()) {
+    let mut it = WalkDir::new(root).follow_links(true).into_iter().filter_entry(is_lua_file);
+    loop {
+        let entry = match it.next() {
+            None => break,
+            Some(Err(err)) => continue,
+            Some(Ok(entry)) => entry,
+        };
+
+        if !is_useful_path(entry.path()) {
+            it.skip_current_dir();
+            continue;
+        }
+
         println!("{:?}", entry.path());
         if entry.file_type().is_file() {
             match rename_in_file(&root, entry.path(), &require_path, &module_name, &fn_name, &new_name) {
