@@ -59,8 +59,8 @@ fn cmd_detect(sub_matches: &ArgMatches) -> Result<()> {
 
     let ctxt = context::Context::new(&input_file);
 
-    let kind = detect::detect_module_kind(&ast, ctxt.clone());
-    println!("{}\t{:?}", &ctxt.module_name, kind);
+    let module = detect::detect_module(&ast, ctxt.clone());
+    println!("{}: {:?}", ctxt.module_name, module);
 
     Ok(())
 }
