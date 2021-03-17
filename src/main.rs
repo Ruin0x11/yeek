@@ -18,7 +18,9 @@ use full_moon::tokenizer::{Token, TokenReference};
 mod ast_util;
 mod context;
 mod detect;
+mod move_module;
 mod refactor;
+mod util;
 
 fn get_app<'a, 'b>() -> App<'a, 'b> {
     App::new("yeek")
@@ -45,6 +47,16 @@ fn get_app<'a, 'b>() -> App<'a, 'b> {
                          .required(true)
                          .help("New function name")
                          .index(3)))
+        .subcommand(SubCommand::with_name("move")
+                    .about("Moves a module to a different directory.")
+                    .arg(Arg::with_name("FILE")
+                         .required(true)
+                         .help("Lua file")
+                         .index(1))
+                    .arg(Arg::with_name("NEW-DIR")
+                         .required(true)
+                         .help("New directory")
+                         .index(2)))
         .subcommand(SubCommand::with_name("dump")
                     .about("Prints the full_moon AST for a Lua source file.")
                     .arg(Arg::with_name("FILE")
@@ -64,6 +76,10 @@ fn unpack_token_reference<'a>(token: Cow<TokenReference<'a>>) -> Vec<Token<'a>> 
 
 fn cmd_detect(sub_matches: &ArgMatches) -> Result<()> {
     let input_file = Path::new(sub_matches.value_of("FILE").unwrap());
+
+    if !input_file.is_file() {
+        return Err(anyhow!("Input file {:?} does not exist", input_file))
+    }
 
     let source = fs::read_to_string(input_file)?;
 
@@ -103,11 +119,17 @@ fn cmd_rename(sub_matches: &ArgMatches) -> Result<()> {
     let fn_name = sub_matches.value_of("FN-NAME").unwrap();
     let new_name = sub_matches.value_of("NEW-NAME").unwrap();
 
+    if !input_file.is_file() {
+        return Err(anyhow!("Input file {:?} does not exist", input_file))
+    }
+
     let root = get_root(input_file).ok_or(anyhow!("Could not find root"))?;
+
+    println!("Renaming function calls...");
 
     let results = refactor::rename_function(&root, &input_file, &fn_name, &new_name)?;
 
-    println!("Performing renames...");
+    println!("Writing code...");
 
     let pb = ProgressBar::new(results.len() as u64);
 
@@ -138,6 +160,70 @@ fn cmd_rename(sub_matches: &ArgMatches) -> Result<()> {
     Ok(())
 }
 
+fn cmd_move(sub_matches: &ArgMatches) -> Result<()> {
+    let input_file = Path::new(sub_matches.value_of("FILE").unwrap());
+    let new_dir = Path::new(sub_matches.value_of("NEW-DIR").unwrap());
+
+    if !input_file.is_file() {
+        return Err(anyhow!("Input file {:?} does not exist", input_file))
+    }
+
+    if !new_dir.is_dir() {
+        return Err(anyhow!("Output directory {:?} does not exist", new_dir))
+    }
+
+    let root = get_root(input_file).ok_or(anyhow!("Could not find root"))?;
+
+    if !new_dir.starts_with(&root) {
+        return Err(anyhow!("New directory {:?} is not contained in OpenNefia root {:?}", new_dir, root))
+    }
+
+    let new_path = new_dir.join(input_file.file_name().unwrap());
+
+    if new_path.is_file() {
+        return Err(anyhow!("New path {:?} already exists", new_path))
+    }
+
+    println!("Updating require paths...");
+
+    let results = move_module::move_module_file(&root, &input_file, &new_path)?;
+
+    println!("Writing code...");
+
+    let pb = ProgressBar::new(results.len() as u64);
+
+    let process = |result: &refactor::RenameResult<'_>| -> Result<()> {
+        if let Some(new_ast) = &result.new_ast {
+            fs::write(&result.filepath, full_moon::print(&new_ast))?;
+        }
+
+        pb.inc(1);
+
+        Ok(())
+    };
+
+    results.par_iter().try_for_each(process)?;
+    pb.finish_with_message("");
+
+    println!("Performing move...");
+
+    fs::copy(input_file, new_path)?;
+    fs::remove_file(input_file)?;
+
+    let mut updated = 0;
+    for result in &results {
+        updated += result.renamed_count;
+
+        for warning in &result.warnings {
+            println!("{}", warning);
+        }
+    }
+
+    println!("Updated {} require paths across {} files.", updated, results.len());
+
+    Ok(())
+}
+
 fn cmd_dump(sub_matches: &ArgMatches) -> Result<()> {
     let input_file = Path::new(sub_matches.value_of("FILE").unwrap());
 
@@ -154,6 +240,7 @@ fn main() -> Result<()> {
     match matches.subcommand() {
         ("detect", Some(sub_matches)) => cmd_detect(&sub_matches)?,
         ("rename", Some(sub_matches)) => cmd_rename(&sub_matches)?,
+        ("move", Some(sub_matches)) => cmd_move(&sub_matches)?,
         ("dump", Some(sub_matches)) => cmd_dump(&sub_matches)?,
         _ => get_app().print_long_help()?
     }

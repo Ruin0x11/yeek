@@ -17,23 +17,12 @@ use indicatif::ProgressBar;
 use rayon::prelude::*;
 use crate::ast_util::scopes::{Variable, ScopeManager};
 use crate::detect;
+use crate::util;
 
 #[derive(Debug, Clone, Copy)]
 enum FnKind {
     Function,
     Method
-}
-
-// NOTE: needs to be kept in sync with how path -> require path resolution is
-// handled in the Lua code
-fn path_to_require_path(path: &str) -> Option<String> {
-    path.to_string()
-        .strip_suffix(".lua")
-        .map(|s| s.replace("/", "."))
-        .map(|s| s.replace("\\", "."))
-        .map(|s| s.strip_suffix(".init").unwrap_or(&s).to_string())
-        .map(|s| s.trim_start_matches(".").to_string())
-        .map(|s| s.to_string())
 }
 
 fn is_module_fn_decl(decl: &ast::FunctionDeclaration, module_name: &str, fn_name: &str) -> Option<FnKind> {
@@ -90,10 +79,6 @@ fn find_fn_def_in_module_file<'a, 'b>(ast: &'a ast::Ast<'b>, module_name: &str, 
     None
 }
 
-fn path_to_module_name(path: &Path) -> String {
-    path.file_stem().unwrap().to_str().unwrap().into()
-}
-
 struct RenameFnDefVisitor {
     module_name: String,
     fn_name: String,
@@ -133,13 +118,13 @@ pub type Range = (Position, Position);
 
 #[derive(Debug)]
 pub struct Warning {
-    filepath: PathBuf,
-    range: Option<Range>,
-    message: String,
+    pub filepath: PathBuf,
+    pub range: Option<Range>,
+    pub message: String,
 }
 
 impl Warning {
-    fn new(filepath: PathBuf, node: &dyn Node, message: String) -> Self {
+    pub fn new(filepath: PathBuf, node: &dyn Node, message: String) -> Self {
         Warning {
             filepath: filepath,
             range: node.range(),
@@ -147,7 +132,7 @@ impl Warning {
         }
     }
 
-    fn new_no_pos(filepath: PathBuf, message: String) -> Self {
+    pub fn new_no_pos(filepath: PathBuf, message: String) -> Self {
         Warning {
             filepath: filepath,
             range: None,
@@ -166,66 +151,39 @@ impl fmt::Display for Warning {
     }
 }
 
-struct RenameFnCallVisitor {
-    filepath: PathBuf,
-    own_require_path: String,
-    require_path: String,
-    module_name: String,
-    fn_name: String,
-    new_name: String,
-    scopes: ScopeManager,
-    referenced_variables: HashSet<Id<Variable>>,
-    renamed_count: u32,
-    warnings: Vec<Warning>
-}
+pub type TokenCow<'a> = Cow<'a, TokenReference<'a>>;
 
-type TokenCow<'a> = Cow<'a, TokenReference<'a>>;
-
-fn make_new_token<'a>(old_tok: &TokenCow<'a>, new_name: String) -> TokenCow<'a> {
+pub fn make_new_token<'a>(old_tok: &TokenCow<'a>, new_name: String) -> TokenCow<'a> {
     let name_tok = Token::new(TokenType::Identifier { identifier: Cow::from(new_name) });
     Cow::Owned(TokenReference::new(old_tok.leading_trivia().cloned().collect(),
                                    name_tok,
                                    old_tok.trailing_trivia().cloned().collect()))
 }
 
-fn make_new_funcall_expr<'a>(old_tok: &TokenCow<'a>, new_name: String, funcall: ast::FunctionCall<'a>, dot: TokenCow<'a>, binop: Option<ast::BinOpRhs<'a>>) -> ast::Expression<'a> {
+fn make_new_funcall<'a>(old_tok: &TokenCow<'a>, new_name: String, funcall: ast::FunctionCall<'a>, dot: TokenCow<'a>) -> ast::FunctionCall<'a> {
     let new_name = make_new_token(old_tok, new_name);
     let new_dot = ast::Index::Dot { dot: dot, name: new_name };
     let new_suffix = ast::Suffix::Index(new_dot);
     let mut new_suffixes = funcall.iter_suffixes().cloned().collect::<Vec<ast::Suffix>>();
     new_suffixes[0] = new_suffix;
-    let new_funcall = funcall.with_suffixes(new_suffixes);
-    let new_value = ast::Value::FunctionCall(new_funcall);
-    ast::Expression::Value { value: Box::new(new_value), binop: binop }
+    funcall.with_suffixes(new_suffixes)
 }
 
-fn make_new_var_expr<'a>(old_tok: &TokenCow<'a>, new_name: String, var_expr: ast::VarExpression<'a>, dot: TokenCow<'a>, binop: Option<ast::BinOpRhs<'a>>) -> ast::Expression<'a> {
+fn make_new_var_expr<'a>(old_tok: &TokenCow<'a>, new_name: String, var_expr: ast::VarExpression<'a>, dot: TokenCow<'a>) -> ast::Var<'a> {
     let new_name = make_new_token(old_tok, new_name);
     let new_dot = ast::Index::Dot { dot: dot, name: new_name };
     let new_suffix = ast::Suffix::Index(new_dot);
     let mut new_suffixes = var_expr.iter_suffixes().cloned().collect::<Vec<ast::Suffix>>();
     new_suffixes[0] = new_suffix;
     let new_var_expr = var_expr.with_suffixes(new_suffixes);
-    let new_value = ast::Value::Var(ast::Var::Expression(new_var_expr));
-    ast::Expression::Value { value: Box::new(new_value), binop: binop }
-}
-
-static REQUIRE_FN_NAME: &str = "require";
-
-fn strip_quotes(mut string: String) -> String {
-    string.pop();
-    string.chars().skip(1).collect()
-}
-
-fn normalize_require_path(string: String) -> String {
-    string.strip_suffix(".init").unwrap_or(&string).to_string()
+    ast::Var::Expression(new_var_expr)
 }
 
 fn extract_require_path<'ast>(expr: &ast::Expression<'ast>) -> Option<String> {
     if let ast::Expression::Value { value: ref val, .. } = expr {
         if let ast::Value::FunctionCall(funcall) = &**val {
             if let ast::Prefix::Name(name) = funcall.prefix() {
-                if name.token().to_string() == REQUIRE_FN_NAME {
+                if name.token().to_string() == util::REQUIRE_FN_NAME {
                     let mut suffixes = funcall.iter_suffixes();
 
                     let first_suffix = suffixes.next();
@@ -237,7 +195,7 @@ fn extract_require_path<'ast>(expr: &ast::Expression<'ast>) -> Option<String> {
                             if let Some(ast::Expression::Value { value: val, .. }) = first_arg {
                                 if let ast::Value::String(s) = &**val {
                                     let raw = s.token().to_string();
-                                    return Some(normalize_require_path(strip_quotes(raw)));
+                                    return Some(util::normalize_require_path(util::strip_quotes(raw)));
                                 }
                             }
                         }
@@ -248,6 +206,19 @@ fn extract_require_path<'ast>(expr: &ast::Expression<'ast>) -> Option<String> {
     }
 
     None
+}
+
+struct RenameFnCallVisitor {
+    filepath: PathBuf,
+    own_require_path: String,
+    require_path: String,
+    module_name: String,
+    fn_name: String,
+    new_name: String,
+    scopes: ScopeManager,
+    referenced_variables: HashSet<Id<Variable>>,
+    renamed_count: u32,
+    warnings: Vec<Warning>
 }
 
 impl RenameFnCallVisitor {
@@ -292,77 +263,74 @@ impl VisitorMut<'_> for RenameFnCallVisitor {
         assign
     }
 
-    fn visit_expression<'ast>(&mut self, expr: ast::Expression<'ast>) -> ast::Expression<'ast> {
-        if let ast::Expression::Value { value: ref val, ref binop } = expr {
-            match &**val {
-                ast::Value::FunctionCall(funcall) => {
-                    if let ast::Prefix::Name(module_name) = funcall.prefix() {
-                        if module_name.token().to_string() == self.module_name {
-                            let mut suffixes = funcall.iter_suffixes();
-                            let first_suffix = suffixes.next();
-                            if let Some(ast::Suffix::Index(ast::Index::Dot { dot, name: fn_name })) = first_suffix {
-                                if fn_name.token().to_string() == self.fn_name {
-                                    if let Some(pos) = module_name.start_position() {
-                                        let byte_pos = pos.bytes();
-                                        if let Some(reference) = self.scopes.reference_at_byte(byte_pos) {
-                                            if let Some(resolved_id) = reference.resolved {
-                                                if self.referenced_variables.contains(&resolved_id) {
-                                                    self.renamed_count += 1;
-                                                    return make_new_funcall_expr(fn_name, self.new_name.clone(), funcall.clone(), dot.clone(), binop.clone());
-                                                }
-                                                else {
-                                                    self.warn(&expr, format!("could not find associated require for funcall stmt"));
-                                                }
-                                            }
-                                            else {
-                                                self.warn(&expr, format!("could not find variable for funcall stmt"));
-                                            }
+    fn visit_var<'ast>(&mut self, var: ast::Var<'ast>) -> ast::Var<'ast> {
+        if let ast::Var::Expression(ref var_expr) = var {
+            if let ast::Prefix::Name(module_name) = var_expr.prefix() {
+                if module_name.token().to_string() == self.module_name {
+                    let mut suffixes = var_expr.iter_suffixes();
+                    let first_suffix = suffixes.next();
+                    if let Some(ast::Suffix::Index(ast::Index::Dot { dot, name: fn_name })) = first_suffix {
+                        if fn_name.token().to_string() == self.fn_name {
+                            if let Some(pos) = module_name.start_position() {
+                                let byte_pos = pos.bytes();
+                                if let Some(reference) = self.scopes.reference_at_byte(byte_pos) {
+                                    if let Some(resolved_id) = reference.resolved {
+                                        if self.referenced_variables.contains(&resolved_id) {
+                                            self.renamed_count += 1;
+                                            return make_new_var_expr(fn_name, self.new_name.clone(), var_expr.clone(), dot.clone());
                                         }
                                         else {
-                                            self.warn(&expr, format!("could not find reference for funcall stmt"));
+                                            self.warn(&var, format!("could not find associated require for funcall stmt"));
                                         }
                                     }
+                                    else {
+                                        self.warn(&var, format!("could not find variable for funcall stmt"));
+                                    }
+                                }
+                                else {
+                                    self.warn(&var, format!("could not find reference for funcall stmt"));
                                 }
                             }
                         }
                     }
-                },
-                ast::Value::Var(ast::Var::Expression(var_expr)) => {
-                    if let ast::Prefix::Name(module_name) = var_expr.prefix() {
-                        if module_name.token().to_string() == self.module_name {
-                            let mut suffixes = var_expr.iter_suffixes();
-                            let first_suffix = suffixes.next();
-                            if let Some(ast::Suffix::Index(ast::Index::Dot { dot, name: fn_name })) = first_suffix {
-                                if fn_name.token().to_string() == self.fn_name {
-                                    if let Some(pos) = module_name.start_position() {
-                                        let byte_pos = pos.bytes();
-                                        if let Some(reference) = self.scopes.reference_at_byte(byte_pos) {
-                                            if let Some(resolved_id) = reference.resolved {
-                                                if self.referenced_variables.contains(&resolved_id) {
-                                                    self.renamed_count += 1;
-                                                    return make_new_var_expr(fn_name, self.new_name.clone(), var_expr.clone(), dot.clone(), binop.clone());
-                                                }
-                                                else {
-                                                    self.warn(&expr, format!("could not find associated require for funcall stmt"));
-                                                }
-                                            }
-                                            else {
-                                                self.warn(&expr, format!("could not find variable for funcall stmt"));
-                                            }
-                                        }
-                                        else {
-                                            self.warn(&expr, format!("could not find reference for funcall stmt"));
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                },
-                _ => ()
+                }
             }
         }
-        expr
+        var
+    }
+
+    fn visit_function_call<'ast>(&mut self, funcall: ast::FunctionCall<'ast>) -> ast::FunctionCall<'ast> {
+        if let ast::Prefix::Name(module_name) = funcall.prefix() {
+            if module_name.token().to_string() == self.module_name {
+                let mut suffixes = funcall.iter_suffixes();
+                let first_suffix = suffixes.next();
+                if let Some(ast::Suffix::Index(ast::Index::Dot { dot, name: fn_name })) = first_suffix {
+                    if fn_name.token().to_string() == self.fn_name {
+                        if let Some(pos) = module_name.start_position() {
+                            let byte_pos = pos.bytes();
+                            if let Some(reference) = self.scopes.reference_at_byte(byte_pos) {
+                                if let Some(resolved_id) = reference.resolved {
+                                    if self.referenced_variables.contains(&resolved_id) {
+                                        self.renamed_count += 1;
+                                        return make_new_funcall(fn_name, self.new_name.clone(), funcall.clone(), dot.clone());
+                                    }
+                                    else {
+                                        self.warn(&funcall, format!("could not find associated require for funcall stmt"));
+                                    }
+                                }
+                                else {
+                                    self.warn(&funcall, format!("could not find variable for funcall stmt"));
+                                }
+                            }
+                            else {
+                                self.warn(&funcall, format!("could not find reference for funcall stmt"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        funcall
     }
 }
 
@@ -377,13 +345,9 @@ pub struct RenameResult<'a> {
 pub fn rename_fn_calls_in_file<'a>(root: &Path, path: &Path, ast: ast::Ast<'_>, require_path: &str, module_name: &str, fn_name: &str, new_name: &str) -> Result<RenameResult<'static>> {
     let scope_manager = ScopeManager::new(&ast);
 
-    // for (_, var) in &scope_manager.variables {
-    //     println!("{:?}", var);
-    // }
-
     let mut visitor = RenameFnCallVisitor {
         filepath: PathBuf::from(path),
-        own_require_path: path_to_require_path(path.strip_prefix(root).unwrap().to_str().unwrap()).unwrap(),
+        own_require_path: util::path_to_require_path(path, root).unwrap(),
         require_path: require_path.to_string(),
         module_name: module_name.to_string(),
         fn_name: fn_name.to_string(),
@@ -401,27 +365,8 @@ pub fn rename_fn_calls_in_file<'a>(root: &Path, path: &Path, ast: ast::Ast<'_>, 
     Ok(RenameResult { filepath: PathBuf::from(path), new_ast: Some(new_ast.owned()), renamed_count: visitor.renamed_count, warnings: visitor.warnings })
 }
 
-fn is_useful_path(path: &Path) -> bool {
-    return !path.ends_with("src/thirdparty")
-}
-
-fn is_lua_file(entry: &walkdir::DirEntry) -> bool {
-    if !is_useful_path(entry.path()) {
-        return false
-    }
-
-    if entry.file_type().is_dir() {
-        return entry.file_name() != "locale"
-    }
-
-    entry.file_name()
-         .to_str()
-         .map(|s| s.ends_with(".lua"))
-         .unwrap_or(false)
-}
-
 pub fn rename_fn_def<'a>(path: &Path, ast: ast::Ast<'a>, fn_name: &str, new_name: &str) -> Result<ast::Ast<'a>> {
-    let module_name = path_to_module_name(path);
+    let module_name = util::path_to_module_name(path);
 
     if find_fn_def_in_module_file(&ast, &module_name, &fn_name).is_none() {
         return Err(anyhow!("Could not find definition in file"))
@@ -438,13 +383,13 @@ pub fn rename_fn_def<'a>(path: &Path, ast: ast::Ast<'a>, fn_name: &str, new_name
 }
 
 pub fn rename_function(root: &Path, path: &Path, fn_name: &str, new_name: &str) -> Result<Vec<RenameResult<'static>>> {
-    let it = WalkDir::new(root).follow_links(true).into_iter().filter_entry(is_lua_file).filter_map(|e| e.ok());
+    let it = WalkDir::new(root).follow_links(true).into_iter().filter_entry(util::is_lua_file).filter_map(|e| e.ok());
     let entries = it.collect::<Vec<_>>();
 
     let pb = ProgressBar::new(entries.len() as u64);
 
-    let module_name = path_to_module_name(path);
-    let require_path = path_to_require_path(path.strip_prefix(root).unwrap().to_str().unwrap()).unwrap();
+    let module_name = util::path_to_module_name(path);
+    let require_path = util::path_to_require_path(path, root).unwrap();
 
     let process = |entry: &walkdir::DirEntry| -> Result<Option<RenameResult<'static>>> {
         let result = if entry.file_type().is_file() {
@@ -641,6 +586,8 @@ function Test.test()
    return env
 end
 
+rnd.rnd = Rand.rnd
+
 return Test
 "#,
                             r#"
@@ -654,7 +601,30 @@ function Test.test()
    return env
 end
 
+rnd.rnd = Rand.asdfg
+
 return Test
+"#,
+
+        );
+    }
+
+    #[test]
+    fn rename_bare_assign_alias() {
+        assert_rename_calls("api/Rand.lua", "api.Rand", "Rand", "rnd", "asdfg",
+                            r#"
+local Rand = {}
+
+Rand.rnd = rnd.rnd
+
+return Rand
+"#,
+                            r#"
+local Rand = {}
+
+Rand.asdfg = rnd.rnd
+
+return Rand
 "#,
 
         );
