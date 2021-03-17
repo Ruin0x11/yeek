@@ -181,15 +181,32 @@ struct RenameFnCallVisitor {
 
 type TokenCow<'a> = Cow<'a, TokenReference<'a>>;
 
-fn make_new_funcall_expr<'a>(new_name: String, funcall: ast::FunctionCall<'a>, dot: TokenCow<'a>, binop: Option<ast::BinOpRhs<'a>>) -> ast::Expression<'a> {
+fn make_new_token<'a>(old_tok: &TokenCow<'a>, new_name: String) -> TokenCow<'a> {
     let name_tok = Token::new(TokenType::Identifier { identifier: Cow::from(new_name) });
-    let new_name = Cow::Owned(TokenReference::new(Vec::new(), name_tok, Vec::new()));
+    Cow::Owned(TokenReference::new(old_tok.leading_trivia().cloned().collect(),
+                                   name_tok,
+                                   old_tok.trailing_trivia().cloned().collect()))
+}
+
+fn make_new_funcall_expr<'a>(old_tok: &TokenCow<'a>, new_name: String, funcall: ast::FunctionCall<'a>, dot: TokenCow<'a>, binop: Option<ast::BinOpRhs<'a>>) -> ast::Expression<'a> {
+    let new_name = make_new_token(old_tok, new_name);
     let new_dot = ast::Index::Dot { dot: dot, name: new_name };
     let new_suffix = ast::Suffix::Index(new_dot);
     let mut new_suffixes = funcall.iter_suffixes().cloned().collect::<Vec<ast::Suffix>>();
     new_suffixes[0] = new_suffix;
     let new_funcall = funcall.with_suffixes(new_suffixes);
     let new_value = ast::Value::FunctionCall(new_funcall);
+    ast::Expression::Value { value: Box::new(new_value), binop: binop }
+}
+
+fn make_new_var_expr<'a>(old_tok: &TokenCow<'a>, new_name: String, var_expr: ast::VarExpression<'a>, dot: TokenCow<'a>, binop: Option<ast::BinOpRhs<'a>>) -> ast::Expression<'a> {
+    let new_name = make_new_token(old_tok, new_name);
+    let new_dot = ast::Index::Dot { dot: dot, name: new_name };
+    let new_suffix = ast::Suffix::Index(new_dot);
+    let mut new_suffixes = var_expr.iter_suffixes().cloned().collect::<Vec<ast::Suffix>>();
+    new_suffixes[0] = new_suffix;
+    let new_var_expr = var_expr.with_suffixes(new_suffixes);
+    let new_value = ast::Value::Var(ast::Var::Expression(new_var_expr));
     ast::Expression::Value { value: Box::new(new_value), binop: binop }
 }
 
@@ -277,40 +294,74 @@ impl VisitorMut<'_> for RenameFnCallVisitor {
 
     fn visit_expression<'ast>(&mut self, expr: ast::Expression<'ast>) -> ast::Expression<'ast> {
         if let ast::Expression::Value { value: ref val, ref binop } = expr {
-            if let ast::Value::FunctionCall(funcall) = &**val {
-                if let ast::Prefix::Name(module_name) = funcall.prefix() {
-                    if module_name.token().to_string() == self.module_name {
-                        let mut suffixes = funcall.iter_suffixes();
-                        let first_suffix = suffixes.next();
-                        if let Some(ast::Suffix::Index(ast::Index::Dot { dot, name: fn_name })) = first_suffix {
-                            if fn_name.token().to_string() == self.fn_name {
-                                if let Some(pos) = module_name.start_position() {
-                                    let byte_pos = pos.bytes();
-                                    if let Some(reference) = self.scopes.reference_at_byte(byte_pos) {
-                                        if let Some(resolved_id) = reference.resolved {
-                                            if self.referenced_variables.contains(&resolved_id) {
-                                                self.renamed_count += 1;
-                                                return make_new_funcall_expr(self.new_name.clone(), funcall.clone(), dot.clone(), binop.clone());
+            match &**val {
+                ast::Value::FunctionCall(funcall) => {
+                    if let ast::Prefix::Name(module_name) = funcall.prefix() {
+                        if module_name.token().to_string() == self.module_name {
+                            let mut suffixes = funcall.iter_suffixes();
+                            let first_suffix = suffixes.next();
+                            if let Some(ast::Suffix::Index(ast::Index::Dot { dot, name: fn_name })) = first_suffix {
+                                if fn_name.token().to_string() == self.fn_name {
+                                    if let Some(pos) = module_name.start_position() {
+                                        let byte_pos = pos.bytes();
+                                        if let Some(reference) = self.scopes.reference_at_byte(byte_pos) {
+                                            if let Some(resolved_id) = reference.resolved {
+                                                if self.referenced_variables.contains(&resolved_id) {
+                                                    self.renamed_count += 1;
+                                                    return make_new_funcall_expr(fn_name, self.new_name.clone(), funcall.clone(), dot.clone(), binop.clone());
+                                                }
+                                                else {
+                                                    self.warn(&expr, format!("could not find associated require for funcall stmt"));
+                                                }
                                             }
                                             else {
-                                                self.warn(&expr, format!("could not find associated require for funcall stmt"));
+                                                self.warn(&expr, format!("could not find variable for funcall stmt"));
                                             }
                                         }
                                         else {
-                                            self.warn(&expr, format!("could not find variable for funcall stmt"));
+                                            self.warn(&expr, format!("could not find reference for funcall stmt"));
                                         }
-                                    }
-                                    else {
-                                        self.warn(&expr, format!("could not find reference for funcall stmt"));
                                     }
                                 }
                             }
                         }
                     }
-                }
+                },
+                ast::Value::Var(ast::Var::Expression(var_expr)) => {
+                    if let ast::Prefix::Name(module_name) = var_expr.prefix() {
+                        if module_name.token().to_string() == self.module_name {
+                            let mut suffixes = var_expr.iter_suffixes();
+                            let first_suffix = suffixes.next();
+                            if let Some(ast::Suffix::Index(ast::Index::Dot { dot, name: fn_name })) = first_suffix {
+                                if fn_name.token().to_string() == self.fn_name {
+                                    if let Some(pos) = module_name.start_position() {
+                                        let byte_pos = pos.bytes();
+                                        if let Some(reference) = self.scopes.reference_at_byte(byte_pos) {
+                                            if let Some(resolved_id) = reference.resolved {
+                                                if self.referenced_variables.contains(&resolved_id) {
+                                                    self.renamed_count += 1;
+                                                    return make_new_var_expr(fn_name, self.new_name.clone(), var_expr.clone(), dot.clone(), binop.clone());
+                                                }
+                                                else {
+                                                    self.warn(&expr, format!("could not find associated require for funcall stmt"));
+                                                }
+                                            }
+                                            else {
+                                                self.warn(&expr, format!("could not find variable for funcall stmt"));
+                                            }
+                                        }
+                                        else {
+                                            self.warn(&expr, format!("could not find reference for funcall stmt"));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                },
+                _ => ()
             }
         }
-
         expr
     }
 }
@@ -450,8 +501,8 @@ mod tests {
                              before: &str,
                              after: &str) {
         let ast = full_moon::parse(before).unwrap();
-        let result = rename_fn_def(&PathBuf::from(path), ast, &fn_name, &new_name).unwrap();
-        assert_eq!(after, full_moon::print(&result.new_ast.unwrap()));
+        let new_ast = rename_fn_def(&PathBuf::from(path), ast, &fn_name, &new_name).unwrap();
+        assert_eq!(after, full_moon::print(&new_ast));
     }
 
     fn assert_rename_calls<'a>(path: &str,
@@ -606,6 +657,36 @@ end
 return Test
 "#,
 
+        );
+    }
+
+    #[test]
+    fn rename_preserves_trivia() {
+        assert_rename_calls("api/Yeek.lua", "api.Rand", "Rand", "rnd", "asdfg",
+                            r#"
+local Rand = require("api.Rand")
+
+local Yeek = {}
+
+function Yeek.test()
+   -- Yee-eek!
+   return Rand.rnd(5) + Rand.rnd(5) -- Yee-eek!
+end
+
+return Yeek
+"#,
+                            r#"
+local Rand = require("api.Rand")
+
+local Yeek = {}
+
+function Yeek.test()
+   -- Yee-eek!
+   return Rand.asdfg(5) + Rand.asdfg(5) -- Yee-eek!
+end
+
+return Yeek
+"#
         );
     }
 }
