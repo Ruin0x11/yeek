@@ -156,9 +156,9 @@ impl VisitorMut<'_> for RenameModuleVisitor {
                         }
                     }
                 }
-                self.warn(&prefix, format!("Found identifier matching old module name"));
+                self.warn(&module_name, format!("Found identifier matching old module name"));
             } else if string == self.new_module_name {
-                self.warn(&prefix, format!("Found identifier matching new module name"));
+                self.warn(&module_name, format!("Found identifier matching new module name"));
             }
         }
         prefix
@@ -199,13 +199,13 @@ impl VisitorMut<'_> for RenameModuleVisitor {
                 let raw = s.token().to_string();
                 let string = util::strip_quotes(raw);
                 if string == self.old_module_name {
-                    self.warn(&s, "Found string constant matching old module name".to_string());
+                    self.warn(&val, "Found string constant matching old module name".to_string());
                 } else if string == self.new_module_name {
-                    self.warn(&s, "Found string constant matching new module name".to_string());
-                } else if string == self.old_require_path {
-                    self.warn(&s, "Found string matching old require path outside require".to_string());
-                } else if string == self.new_require_path {
-                    self.warn(&s, "Found string matching new require path outside require".to_string());
+                    self.warn(&val, "Found string constant matching new module name".to_string());
+                // } else if string == self.old_require_path {
+                //     self.warn(&val, "Found string matching old require path outside require".to_string());
+                // } else if string == self.new_require_path {
+                //     self.warn(&val, "Found string matching new require path outside require".to_string());
                 }
             }
         }
@@ -626,22 +626,22 @@ local Dood
         );
     }
 
-    #[test]
-    fn warns_about_literal_require_path() {
-        assert_warns("src/api/test.lua", "src/api/Rand.lua", "Dood",
-                     r#"
-local path = "api.Rand"
-"#,
-                     "Found string matching old require path outside require"
-        );
+//     #[test]
+//     fn warns_about_literal_require_path() {
+//         assert_warns("src/api/test.lua", "src/api/Rand.lua", "Dood",
+//                      r#"
+// local path = "api.Rand"
+// "#,
+//                      "Found string matching old require path outside require"
+//         );
 
-        assert_warns("src/api/test.lua", "src/api/Rand.lua", "Dood",
-                     r#"
-local path = "api.Dood"
-"#,
-                     "Found string matching new require path outside require"
-        );
-    }
+//         assert_warns("src/api/test.lua", "src/api/Rand.lua", "Dood",
+//                      r#"
+// local path = "api.Dood"
+// "#,
+//                      "Found string matching new require path outside require"
+//         );
+//     }
 
     #[test]
     fn warns_about_literal_identifier() {
