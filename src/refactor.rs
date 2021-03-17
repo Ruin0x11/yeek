@@ -130,6 +130,14 @@ impl Warning {
         }
     }
 
+    pub fn new_from_range(filepath: PathBuf, range: Range, message: String) -> Self {
+        Warning {
+            filepath: filepath,
+            range: Some(range),
+            message: message
+        }
+    }
+
     pub fn new_no_pos(filepath: PathBuf, message: String) -> Self {
         Warning {
             filepath: filepath,

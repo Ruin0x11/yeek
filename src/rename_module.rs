@@ -17,7 +17,7 @@ use itertools::{
     EitherOrBoth::*,
 };
 use rayon::prelude::*;
-use crate::ast_util::scopes::{Variable, ScopeManager};
+use crate::ast_util::scopes::{Reference, Variable, ScopeManager};
 use crate::detect;
 use crate::move_module;
 use crate::refactor::{self, RenameResult, TokenCow, Warning};
@@ -37,12 +37,6 @@ struct RenameModuleVisitor {
     warnings: Vec<Warning>
 }
 
-impl RenameModuleVisitor {
-    fn warn(&mut self, node: &dyn Node, message: String) {
-        self.warnings.push(Warning::new(self.filepath.clone(), node, message));
-    }
-}
-
 fn make_new_prefix_name<'a>(old_tok: &TokenCow<'a>, new_name: String) -> ast::Prefix<'a> {
     let new_name = refactor::make_new_token(old_tok, new_name);
     ast::Prefix::Name(new_name)
@@ -54,6 +48,26 @@ fn make_new_var_name<'a>(old_tok: &TokenCow<'a>, new_name: String) -> ast::Var<'
 }
 
 type NameList<'a> = Punctuated<'a, TokenCow<'a>>;
+
+impl RenameModuleVisitor {
+    fn warn(&mut self, node: &dyn Node, message: String) {
+        self.warnings.push(Warning::new(self.filepath.clone(), node, message));
+    }
+
+    fn warn_shadowing(&mut self, node: &dyn Node, new_name: String) {
+        let mut warn = false;
+        for (scope_id, scope) in &self.scopes.scopes {
+            if let Some(var_id) = self.scopes.variable_in_scope(scope_id, &new_name) {
+                // TODO no way to construct full_moon's Position struct...
+                // self.warnings.push(Warning::new_from_range(self.filepath.clone(), ident_range, format!("Rename now shadows variable previously in scope")));
+                warn = true
+            }
+        }
+        if warn {
+            self.warn(node, format!("Rename now shadows variable previously in scope"));
+        }
+    }
+}
 
 impl VisitorMut<'_> for RenameModuleVisitor {
     fn visit_local_assignment<'ast>(&mut self, assign: ast::LocalAssignment<'ast>) -> ast::LocalAssignment<'ast> {
@@ -98,6 +112,7 @@ impl VisitorMut<'_> for RenameModuleVisitor {
                                             None => Pair::End(new_name),
                                         };
                                         new_names.push(new_name_pair);
+
                                         found = true;
                                     }
                                     else {
@@ -117,6 +132,8 @@ impl VisitorMut<'_> for RenameModuleVisitor {
                 }
                 if !found {
                     new_names.push(np.clone());
+                } else {
+                    self.warn_shadowing(&assign, self.new_module_name.clone());
                 }
             }
         }
@@ -376,7 +393,7 @@ mod tests {
         let ast = full_moon::parse(before).unwrap();
         let result = update_require_paths_and_module_identifiers(&root, &PathBuf::from(path), ast, &old_module_name, &new_module_name, &old_require_path, &new_require_path).unwrap();
 
-        assert_eq!(Some(warning.to_string()), result.warnings.iter().next().map(|w| w.message.clone()));
+        assert!(result.warnings.iter().any(|w| w.message == warning), format!("\n{:?}", result.warnings));
     }
 
     #[test]
@@ -684,6 +701,39 @@ end
 return Dood
 "#,
                      "Found local assignment matching new module name"
+        );
+    }
+
+    #[test]
+    fn warns_about_shadowing_caused_by_rename() {
+        assert_warns("src/api/Rand.lua", "src/api/Rand.lua", "Dood",
+                     r#"
+local Rand = {}
+
+function Rand.rnd(n)
+   local Dood = {}
+   return rng:rnd(n)
+end
+
+return Rand
+"#,
+                     "Rename now shadows variable previously in scope"
+        );
+
+        assert_warns("src/api/test.lua", "src/api/Rand.lua", "Dood",
+                     r#"
+local Dood = {}
+local Rand = require("api.Rand")
+"#,
+                     "Rename now shadows variable previously in scope"
+        );
+
+        assert_warns("src/api/test.lua", "src/api/Rand.lua", "Dood",
+                     r#"
+local Rand = require("api.Rand")
+local Dood = {}
+"#,
+                     "Rename now shadows variable previously in scope"
         );
     }
 }
