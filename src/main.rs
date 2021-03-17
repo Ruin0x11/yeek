@@ -20,11 +20,17 @@ fn get_app<'a, 'b>() -> App<'a, 'b> {
         .author(crate_authors!())
         .about("Yee-eek!")
         .subcommand(SubCommand::with_name("detect")
+                    .about("Detects the type of module in a Lua source file.")
                     .arg(Arg::with_name("FILE")
                          .required(true)
                          .help("Lua file")
-                         .index(1))
-        )
+                         .index(1)))
+        .subcommand(SubCommand::with_name("dump")
+                    .about("Prints the full_moon AST for a Lua source file.")
+                    .arg(Arg::with_name("FILE")
+                         .required(true)
+                         .help("Lua file")
+                         .index(1)))
 }
 
 fn unpack_token_reference<'a>(token: Cow<TokenReference<'a>>) -> Vec<Token<'a>> {
@@ -65,11 +71,27 @@ fn cmd_detect(sub_matches: &ArgMatches) -> Result<()> {
     Ok(())
 }
 
+fn cmd_dump(sub_matches: &ArgMatches) -> Result<()> {
+    let input_file = Path::new(sub_matches.value_of("FILE").unwrap());
+
+    let source = fs::read_to_string(input_file)?;
+
+    let tokens = tokenizer::tokens(&source)?;
+
+    let ast = ast::Ast::from_tokens(tokens)
+        .unwrap_or_else(|error| panic!("couldn't make ast for {:?} - {:?}", input_file, error));
+
+    println!("{:#?}", ast);
+
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let matches = get_app().get_matches();
 
     match matches.subcommand() {
         ("detect", Some(sub_matches)) => cmd_detect(&sub_matches)?,
+        ("dump", Some(sub_matches)) => cmd_dump(&sub_matches)?,
         _ => get_app().print_long_help()?
     }
 
