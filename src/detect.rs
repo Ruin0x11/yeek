@@ -2,32 +2,32 @@ use full_moon::ast::{self, Ast};
 use full_moon::visitors::Visitor;
 use crate::context::Context;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterfaceName(String);
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiDef;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClassDef {
     pub serial_id: String,
     pub implements: Vec<InterfaceName>
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InterfaceDef {
     pub serial_id: String,
     // TODO
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModuleKind {
     Api(ApiDef),
     Class(ClassDef),
     Interface(InterfaceDef),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Module {
     name: String,
     kind: ModuleKind
@@ -91,20 +91,41 @@ fn detect_class_info(args: &ast::FunctionArgs) -> Option<ClassDef> {
     None
 }
 
-fn detect_class_module_declaration(expr: &ast::Expression) -> Option<ModuleKind> {
+fn detect_interface_info(args: &ast::FunctionArgs) -> Option<InterfaceDef> {
+    if let ast::FunctionArgs::Parentheses { arguments, .. } = args {
+        let mut iter = arguments.iter();
+
+        let first_arg = iter.next();
+        if let Some(ast::Expression::Value { value: val, .. }) = first_arg {
+            if let ast::Value::String(s) = &**val {
+                let serial_id = s.token().to_string();
+
+                // TODO requirements, parents
+
+                let def = InterfaceDef {
+                    serial_id: serial_id,
+                };
+
+                return Some(def)
+            }
+        }
+    }
+    None
+}
+
+fn get_prefixed_call<'a, 'b>(expr: &'a ast::Expression<'b>, module_name: &str, fn_name: &str) -> Option<&'a ast::FunctionArgs<'b>> {
     if let ast::Expression::Value { value: val, .. } = expr {
         if let ast::Value::FunctionCall(funcall) = &**val {
             if let ast::Prefix::Name(name) = funcall.prefix() {
-                if name.token().to_string() == CLASS_MODULE_NAME {
+                if name.token().to_string() == module_name {
                     let mut suffixes = funcall.iter_suffixes();
 
                     let first_suffix = suffixes.next();
                     if let Some(ast::Suffix::Index(ast::Index::Dot { name, .. })) = first_suffix {
-                        if name.token().to_string() == CLASS_DECL_FN_NAME {
+                        if name.token().to_string() == fn_name {
                             let second_suffix = suffixes.next();
                             if let Some(ast::Suffix::Call(ast::Call::AnonymousCall(args))) = second_suffix {
-                                return detect_class_info(args)
-                                    .map(ModuleKind::Class)
+                                return Some(args)
                             }
                         }
                     }
@@ -117,6 +138,18 @@ fn detect_class_module_declaration(expr: &ast::Expression) -> Option<ModuleKind>
     None
 }
 
+fn detect_class_module_declaration(expr: &ast::Expression) -> Option<ModuleKind> {
+    return get_prefixed_call(expr, CLASS_MODULE_NAME, CLASS_DECL_FN_NAME)
+        .and_then(|args| detect_class_info(args))
+        .map(ModuleKind::Class)
+}
+
+fn detect_interface_module_declaration(expr: &ast::Expression) -> Option<ModuleKind> {
+    return get_prefixed_call(expr, CLASS_MODULE_NAME, INTERFACE_DECL_FN_NAME)
+        .and_then(|args| detect_interface_info(args))
+        .map(ModuleKind::Interface)
+}
+
 fn is_empty_constructor_expression(expr: &ast::Expression) -> bool {
     if let ast::Expression::Value { value: val, .. } = expr {
         if let ast::Value::TableConstructor(tbl) = &**val {
@@ -124,6 +157,22 @@ fn is_empty_constructor_expression(expr: &ast::Expression) -> bool {
         }
     }
     false
+}
+
+fn detect_module_declaration_in_expr(ctxt: &Context, first_expr: &ast::Expression<'_>) -> Option<Module> {
+    if is_empty_constructor_expression(&first_expr) {
+        return Some(Module { name: ctxt.module_name.clone(), kind: ModuleKind::Api(ApiDef) })
+    }
+
+    if let Some(class_module) = detect_class_module_declaration(&first_expr) {
+        return Some(Module { name: ctxt.module_name.clone(), kind: class_module })
+    }
+
+    if let Some(iface_module) = detect_interface_module_declaration(&first_expr) {
+        return Some(Module { name: ctxt.module_name.clone(), kind: iface_module })
+    }
+
+    None
 }
 
 fn detect_module_declaration(ctxt: &Context, assign: &ast::LocalAssignment<'_>) -> Option<Module> {
@@ -141,27 +190,26 @@ fn detect_module_declaration(ctxt: &Context, assign: &ast::LocalAssignment<'_>) 
         return None
     }
 
-    if is_empty_constructor_expression(&first_expr) {
-        return Some(Module { name: ctxt.module_name.clone(), kind: ModuleKind::Api(ApiDef) })
-    }
+    detect_module_declaration_in_expr(ctxt, &first_expr)
+}
 
-    if let Some(class_module) = detect_class_module_declaration(&first_expr) {
-        return Some(Module { name: ctxt.module_name.clone(), kind: class_module })
+fn find_module_declaration<'a, 'b>(ctxt: &Context, stmt: &'a ast::Stmt<'b>) -> Option<Module> {
+    match stmt {
+        ast::Stmt::LocalAssignment(assign) => {
+            if let Some(module_kind) = detect_module_declaration(ctxt, &assign) {
+                return Some(module_kind)
+            }
+        },
+        _ => ()
     }
-
     None
 }
 
 fn find_module_declarations<'a, 'b>(ctxt: &Context, block: &'a ast::Block<'b>) -> Vec<Module> {
     let mut result = Vec::new();
     for stmt in block.iter_stmts() {
-        match stmt {
-            ast::Stmt::LocalAssignment(assign) => {
-                if let Some(module_kind) = detect_module_declaration(ctxt, &assign) {
-                    result.push(module_kind)
-                }
-            },
-            _ => ()
+        if let Some(module) = find_module_declaration(ctxt, stmt) {
+            result.push(module);
         }
     }
     result
@@ -170,13 +218,7 @@ fn find_module_declarations<'a, 'b>(ctxt: &Context, block: &'a ast::Block<'b>) -
 fn returns_assigned_local<'a, 'b>(module_name: &str, ret: &'a ast::Return<'b>) -> bool {
     let returns = ret.returns();
 
-    if returns.len() == 0 {
-        return false
-    }
-
-    let first_return = returns.iter().next().unwrap();
-
-    if let ast::Expression::Value { value: val, .. } = first_return {
+    if let Some(ast::Expression::Value { value: val, .. }) = returns.iter().next() {
         if let ast::Value::Var(var) = &**val {
             if let ast::Var::Name(name) = var {
                 return name.token().to_string() == module_name
@@ -205,28 +247,32 @@ impl ModuleDetectVisitor {
     fn visit_top_level_block(&mut self, block: &ast::Block) {
         let modules = find_module_declarations(&self.ctxt, block);
         let last_stmt_opt = block.last_stmt();
+        let mut found = None;
 
-        // TODO detect joined creation and return (return class.class(...))
         for module in modules.iter() {
             if let Some(ast::LastStmt::Return(ret)) = last_stmt_opt {
                 if returns_assigned_local(&module.name, ret) {
-                    self.module = Some(module.clone());
+                    found = Some(module.clone());
                     break;
                 }
             }
         }
+
+        if found.is_none() {
+            if let Some(ast::LastStmt::Return(ret)) = last_stmt_opt {
+                if let Some(expr) = ret.returns().iter().next() {
+                    if let Some(module) = detect_module_declaration_in_expr(&self.ctxt, expr) {
+                        found = Some(module.clone());
+                    }
+                }
+            }
+        }
+
+        self.module = found;
     }
 }
 
 impl Visitor<'_> for ModuleDetectVisitor {
-    fn visit_function_call(&mut self, call: &ast::FunctionCall) {
-        // println!("Yee-eek! {:?}", call)
-    }
-
-    fn visit_local_assignment(&mut self, node: &ast::LocalAssignment) {
-        // println!("Yee-eek! {:?}", node)
-    }
-
     fn visit_block(&mut self, block: &ast::Block) {
         if self.is_top_level {
             self.is_top_level = false;
@@ -242,4 +288,242 @@ pub fn detect_module<'a>(ast: &Ast<'a>, ctxt: Context) -> Option<Module> {
     visitor.visit_ast(ast);
 
     visitor.module
+}
+
+
+#[cfg(test)]
+mod tests {
+    use crate::detect::*;
+    use full_moon;
+    use std::path::PathBuf;
+
+    fn parse_detect<'a>(filename: &'a str, code: &'a str) -> Option<Module> {
+        let ast = full_moon::parse(code).unwrap();
+        let ctxt = Context::new(&PathBuf::from(filename));
+        detect_module(&ast, ctxt)
+    }
+
+    #[test]
+    fn detects_api_module() {
+        assert_eq!(parse_detect(
+            "Api.lua",
+            r#"
+local Api = {}
+
+return Api
+"#),
+            Some(Module {
+                name: "Api".into(),
+                kind: ModuleKind::Api(ApiDef)
+            })
+        );
+    }
+
+    #[test]
+    fn detects_reassigned_api_module() {
+        assert_eq!(parse_detect(
+            "Api.lua",
+            r#"
+local Api = {}
+
+Api = nil
+
+return Api
+"#),
+            Some(Module {
+                name: "Api".into(),
+                kind: ModuleKind::Api(ApiDef)
+            })
+        );
+    }
+
+    #[test]
+    fn does_not_detect_misnamed_api_module() {
+        assert_eq!(parse_detect(
+            "Dood.lua",
+            r#"
+local Api = {}
+
+return Api
+"#),
+            None
+        );
+    }
+
+    #[test]
+    fn does_not_detect_differing_return() {
+        assert_eq!(parse_detect(
+            "Api.lua",
+            r#"
+local Api = {}
+local Dood = nil
+
+return Dood
+"#),
+            None
+        );
+    }
+
+    #[test]
+    fn detects_proper_returned_module() {
+        assert_eq!(parse_detect(
+            "Api.lua",
+            r#"
+local Dood = {}
+local Api = {}
+
+return Api
+"#),
+            Some(Module {
+                name: "Api".into(),
+                kind: ModuleKind::Api(ApiDef)
+            })
+        );
+    }
+
+    #[test]
+    fn does_not_detect_at_below_top_level() {
+        assert_eq!(parse_detect(
+            "Api.lua",
+            r#"
+local function dood()
+   local Api = {}
+
+   return Api
+end
+
+return dood()
+"#),
+            None
+        );
+    }
+
+    #[test]
+    fn detects_class_module() {
+        assert_eq!(parse_detect(
+            "Class.lua",
+            r#"
+local Class = class.class("MyClass")
+
+return Class
+"#),
+            Some(Module {
+                name: "Class".into(),
+                kind: ModuleKind::Class(
+                    ClassDef { serial_id: "\"MyClass\"".into(), implements: Vec::new() }
+                )
+            })
+        );
+    }
+
+    #[test]
+    fn detects_class_module_implements_single() {
+        assert_eq!(parse_detect(
+            "Class.lua",
+            r#"
+local Class = class.class("MyClass", ILocation)
+
+return Class
+"#),
+            Some(Module {
+                name: "Class".into(),
+                kind: ModuleKind::Class(
+                    ClassDef { serial_id: "\"MyClass\"".into(), implements: vec![
+                        InterfaceName("ILocation".into())
+                    ] }
+                )
+            })
+        );
+    }
+
+    #[test]
+    fn detects_class_module_implements_multiple() {
+        assert_eq!(parse_detect(
+            "Class.lua",
+            r#"
+local Class = class.class("MyClass", { IOwned, ILocation })
+
+return Class
+"#),
+            Some(Module {
+                name: "Class".into(),
+                kind: ModuleKind::Class(
+                    ClassDef { serial_id: "\"MyClass\"".into(), implements: vec![
+                        InterfaceName("IOwned".into()),
+                        InterfaceName("ILocation".into())
+                    ] }
+                )
+            })
+        );
+    }
+
+    #[test]
+    fn detects_primary_class_module() {
+        assert_eq!(parse_detect(
+            "Class.lua",
+            r#"
+local Other = class.class("MyOther")
+
+local Class = class.class("MyClass")
+
+return Class
+"#),
+            Some(Module {
+                name: "Class".into(),
+                kind: ModuleKind::Class(
+                    ClassDef { serial_id: "\"MyClass\"".into(), implements: Vec::new() }
+                )
+            })
+        );
+    }
+
+    #[test]
+    fn detects_class_module_joined_return() {
+        assert_eq!(parse_detect(
+            "Class.lua",
+            r#"
+return class.class("MyClass")
+"#),
+            Some(Module {
+                name: "Class".into(),
+                kind: ModuleKind::Class(
+                    ClassDef { serial_id: "\"MyClass\"".into(), implements: Vec::new() }
+                )
+            })
+        );
+    }
+
+    #[test]
+    fn detects_interface_module() {
+        assert_eq!(parse_detect(
+            "IInterface.lua",
+            r#"
+local IInterface = class.interface("IMyInterface")
+
+return IInterface
+"#),
+            Some(Module {
+                name: "IInterface".into(),
+                kind: ModuleKind::Interface(
+                    InterfaceDef { serial_id: "\"IMyInterface\"".into() }
+                )
+            })
+        );
+    }
+
+    #[test]
+    fn detects_interface_module_joined_return() {
+        assert_eq!(parse_detect(
+            "IInterface.lua",
+            r#"
+return class.interface("IMyInterface")
+"#),
+            Some(Module {
+                name: "IInterface".into(),
+                kind: ModuleKind::Interface(
+                    InterfaceDef { serial_id: "\"IMyInterface\"".into() }
+                )
+            })
+        );
+    }
 }
