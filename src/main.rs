@@ -1,11 +1,12 @@
 extern crate anyhow;
 extern crate clap;
 extern crate full_moon;
+extern crate walkdir;
 
 use std::fs;
 use std::borrow::Cow;
-use std::path::{Path};
-use anyhow::Result;
+use std::path::{Path, PathBuf};
+use anyhow::{anyhow, Result};
 use clap::{Arg, App, SubCommand, ArgMatches, crate_version, crate_authors};
 
 use full_moon::{ast, node::Node};
@@ -87,12 +88,26 @@ fn cmd_detect(sub_matches: &ArgMatches) -> Result<()> {
     Ok(())
 }
 
+fn get_root(input_file: &Path) -> Option<PathBuf> {
+    let mut new = input_file.clone();
+
+    for parent in input_file.ancestors() {
+        if parent.join(".git").is_dir() {
+            return Some(parent.join("src/"))
+        }
+    }
+
+    None
+}
+
 fn cmd_rename(sub_matches: &ArgMatches) -> Result<()> {
     let input_file = Path::new(sub_matches.value_of("FILE").unwrap());
     let fn_name = sub_matches.value_of("FN-NAME").unwrap();
     let new_name = sub_matches.value_of("NEW-NAME").unwrap();
 
-    refactor::rename_function(&input_file, &fn_name, &new_name);
+    let root = get_root(input_file).ok_or(anyhow!("Could not find root"))?;
+
+    refactor::rename_function(&root, &input_file, &fn_name, &new_name)?;
 
     Ok(())
 }

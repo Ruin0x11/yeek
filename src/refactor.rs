@@ -4,6 +4,7 @@ use full_moon::visitors::VisitorMut;
 use full_moon::ast::punctuated::{Punctuated, Pair};
 
 use anyhow::{anyhow, Result};
+use walkdir::WalkDir;
 use std::borrow::Cow;
 use std::fs;
 use std::path::Path;
@@ -118,8 +119,83 @@ impl VisitorMut<'_> for RenameFnDefVisitor {
     }
 }
 
+struct RenameFnCallVisitor {
+    require_path: String,
+    module_name: String,
+    fn_name: String,
+    new_name: String,
+    scopes: ScopeManager
+}
 
-pub fn rename_function(path: &Path, fn_name: &str, new_name: &str) -> Result<()> {
+impl VisitorMut<'_> for RenameFnCallVisitor {
+    fn visit_expression<'ast>(&mut self, expr: ast::Expression<'ast>) -> ast::Expression<'ast> {
+        if let ast::Expression::Value { value: ref val, ref binop } = expr {
+            if let ast::Value::FunctionCall(funcall) = &**val {
+                if let ast::Prefix::Name(name) = funcall.prefix() {
+                    if name.token().to_string() == self.module_name {
+                        let mut suffixes = funcall.iter_suffixes();
+
+                        let first_suffix = suffixes.next();
+                        if let Some(ast::Suffix::Index(ast::Index::Dot { dot, name })) = first_suffix {
+                            if name.token().to_string() == self.fn_name {
+                                let name_tok = Token::new(TokenType::Identifier { identifier: Cow::from(self.new_name.clone()) });
+                                let new_name = Cow::Owned(TokenReference::new(Vec::new(), name_tok, Vec::new()));
+                                let new_dot = ast::Index::Dot { dot: dot.clone(), name: new_name };
+                                let new_suffix = ast::Suffix::Index(new_dot);
+                                let mut new_suffixes = funcall.iter_suffixes().cloned().collect::<Vec<ast::Suffix>>();
+                                new_suffixes[0] = new_suffix;
+                                let new_funcall = funcall.clone().with_suffixes(new_suffixes);
+                                let new_value = ast::Value::FunctionCall(new_funcall);
+                                return ast::Expression::Value { value: Box::new(new_value), binop: binop.clone() }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        expr
+    }
+}
+
+pub fn rename_in_file(path: &Path, require_path: &str, module_name: &str, fn_name: &str, new_name: &str) -> Result<()> {
+    let source = fs::read_to_string(path)?;
+
+    let mut ast: ast::Ast<'_> = full_moon::parse(&source).unwrap();
+
+    let scope_manager = ScopeManager::new(&ast);
+
+    // for (_, var) in &scope_manager.variables {
+    //     println!("{:?}", var);
+    // }
+
+    let mut visitor = RenameFnCallVisitor {
+        require_path: require_path.to_string(),
+        module_name: module_name.to_string(),
+        fn_name: fn_name.to_string(),
+        new_name: new_name.to_string(),
+        scopes: scope_manager
+    };
+
+    let new_ast = visitor.visit_ast(ast);
+
+    println!("{}", full_moon::print(&new_ast));
+
+    Ok(())
+}
+
+fn is_lua_file(entry: &walkdir::DirEntry) -> bool {
+    if entry.file_type().is_dir() {
+        return true
+    }
+
+    entry.file_name()
+         .to_str()
+         .map(|s| s.ends_with(".lua"))
+         .unwrap_or(false)
+}
+
+pub fn rename_function(root: &Path, path: &Path, fn_name: &str, new_name: &str) -> Result<()> {
     let source = fs::read_to_string(path)?;
 
     let mut ast: ast::Ast<'_> = full_moon::parse(&source).unwrap();
@@ -138,13 +214,16 @@ pub fn rename_function(path: &Path, fn_name: &str, new_name: &str) -> Result<()>
 
     let new_ast = rename_fn_visitor.visit_ast(ast);
 
-    println!("{}", full_moon::print(&new_ast));
+    // println!("{}", full_moon::print(&new_ast));
 
-    // let scope_manager = ScopeManager::new(&ast);
+    let require_path = path_to_require_path(path.to_str().unwrap()).unwrap();
 
-    // for (_, reference) in &scope_manager.references {
-    //     // println!("{:?}", reference);
-    // }
+    let walker = WalkDir::new(root).into_iter();
+    for entry in walker.filter_entry(is_lua_file).filter_map(|e| e.ok()) {
+        if entry.file_type().is_file() {
+            rename_in_file(entry.path(), &require_path, &module_name, &fn_name, &new_name)?;
+        }
+    }
 
     Ok(())
 }
