@@ -1,7 +1,8 @@
 use full_moon::ast;
+use full_moon::ast::punctuated::{Punctuated, Pair};
+use full_moon::ast::owned::Owned;
 use full_moon::tokenizer::{Position, Token, TokenReference, TokenType};
 use full_moon::visitors::VisitorMut;
-use full_moon::ast::punctuated::{Punctuated, Pair};
 use full_moon::node::Node;
 
 use anyhow::{anyhow, Result};
@@ -126,10 +127,10 @@ impl VisitorMut<'_> for RenameFnDefVisitor {
     }
 }
 
-type Range = (Position, Position);
+pub type Range = (Position, Position);
 
 #[derive(Debug)]
-struct Warning {
+pub struct Warning {
     filepath: PathBuf,
     range: Option<Range>,
     message: String,
@@ -250,7 +251,6 @@ impl VisitorMut<'_> for RenameFnCallVisitor {
                     }
 
                     if proceed {
-                        println!("proceed {:?}", name);
                         if let Some(pos) = name.start_position() {
                             let byte_pos = pos.bytes();
                             if let Some(reference) = self.scopes.reference_at_byte(byte_pos) {
@@ -316,16 +316,14 @@ impl VisitorMut<'_> for RenameFnCallVisitor {
 }
 
 #[derive(Debug)]
-struct RenameResult {
+pub struct RenameResult<'a> {
+    pub filepath: PathBuf,
+    pub new_ast: ast::Ast<'a>,
     pub renamed_count: u32,
     pub warnings: Vec<Warning>
 }
 
-fn rename_in_file(root: &Path, path: &Path, require_path: &str, module_name: &str, fn_name: &str, new_name: &str) -> Result<RenameResult> {
-    let source = fs::read_to_string(path)?;
-
-    let ast: ast::Ast<'_> = full_moon::parse(&source).map_err(|e| anyhow!(format!("{}", e)))?;
-
+pub fn rename_fn_calls_in_file<'a>(root: &Path, path: &Path, ast: ast::Ast<'_>, require_path: &str, module_name: &str, fn_name: &str, new_name: &str) -> Result<RenameResult<'static>> {
     let scope_manager = ScopeManager::new(&ast);
 
     // for (_, var) in &scope_manager.variables {
@@ -345,11 +343,11 @@ fn rename_in_file(root: &Path, path: &Path, require_path: &str, module_name: &st
         warnings: Vec::new()
     };
 
-    let _new_ast = visitor.visit_ast(ast);
+    let new_ast = visitor.visit_ast(ast);
 
     // println!("{}", full_moon::print(&new_ast));
 
-    Ok(RenameResult { renamed_count: visitor.renamed_count, warnings: visitor.warnings })
+    Ok(RenameResult { filepath: PathBuf::from(path), new_ast: new_ast.owned(), renamed_count: visitor.renamed_count, warnings: visitor.warnings })
 }
 
 fn is_lua_file(entry: &walkdir::DirEntry) -> bool {
@@ -367,11 +365,7 @@ fn is_useful_path(path: &Path) -> bool {
     return !path.ends_with("src/thirdparty")
 }
 
-pub fn rename_function(root: &Path, path: &Path, fn_name: &str, new_name: &str) -> Result<()> {
-    let source = fs::read_to_string(path)?;
-
-    let ast: ast::Ast<'_> = full_moon::parse(&source).unwrap();
-
+pub fn rename_fn_def(path: &Path, ast: ast::Ast<'_>, fn_name: &str, new_name: &str) -> Result<RenameResult<'static>> {
     let module_name = path_to_module_name(path);
 
     if find_fn_def_in_module_file(&ast, &module_name, &fn_name).is_none() {
@@ -384,10 +378,25 @@ pub fn rename_function(root: &Path, path: &Path, fn_name: &str, new_name: &str) 
         new_name: new_name.to_string()
     };
 
-    let _new_ast = rename_fn_visitor.visit_ast(ast);
+    let new_ast = rename_fn_visitor.visit_ast(ast);
 
-    // println!("{}", full_moon::print(&new_ast));
+    Ok(RenameResult {
+        filepath: PathBuf::from(path),
+        new_ast: new_ast.owned(),
+        renamed_count: 0,
+        warnings: Vec::new()
+    })
+}
 
+pub fn rename_function(root: &Path, path: &Path, fn_name: &str, new_name: &str) -> Result<Vec<RenameResult<'static>>> {
+    let source = fs::read_to_string(path)?;
+    let ast: ast::Ast<'_> = full_moon::parse(&source).map_err(|e| anyhow!(format!("{}", e)))?;
+
+    let result = rename_fn_def(&path, ast, &fn_name, &new_name)?;
+
+    let mut results = vec![result];
+
+    let module_name = path_to_module_name(path);
     let require_path = path_to_require_path(path.strip_prefix(root).unwrap().to_str().unwrap()).unwrap();
 
     let mut renamed_count = 0;
@@ -397,7 +406,7 @@ pub fn rename_function(root: &Path, path: &Path, fn_name: &str, new_name: &str) 
     loop {
         let entry = match it.next() {
             None => break,
-            Some(Err(err)) => continue,
+            Some(Err(_)) => continue,
             Some(Ok(entry)) => entry,
         };
 
@@ -406,24 +415,155 @@ pub fn rename_function(root: &Path, path: &Path, fn_name: &str, new_name: &str) 
             continue;
         }
 
-        println!("{:?}", entry.path());
         if entry.file_type().is_file() {
-            match rename_in_file(&root, entry.path(), &require_path, &module_name, &fn_name, &new_name) {
+            let source = fs::read_to_string(entry.path())?;
+            let ast: ast::Ast<'_> = full_moon::parse(&source).map_err(|e| anyhow!(format!("{}", e)))?;
+
+            match rename_fn_calls_in_file(&root, entry.path(), ast, &require_path, &module_name, &fn_name, &new_name) {
                 Err(err) => warnings.push(Warning::new_no_pos(entry.path().into(), format!("Could not parse: {}", err))),
-                Ok(mut r) => {
-                    println!("{:?}", r);
-                    renamed_count += r.renamed_count;
-                    warnings.append(&mut r.warnings)
-                }
+                Ok(r) => results.push(r)
             }
         }
     }
 
-    for warning in warnings.iter() {
-        println!("{}", warning);
+    Ok(results)
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::refactor::*;
+    use full_moon;
+    use std::path::PathBuf;
+
+    fn assert_rename_def<'a>(path: &str,
+                             fn_name: &str,
+                             new_name: &str,
+                             before: &str,
+                             after: &str) {
+        let ast = full_moon::parse(before).unwrap();
+        let result = rename_fn_def(&PathBuf::from(path), ast, &fn_name, &new_name).unwrap();
+        assert_eq!(after, full_moon::print(&result.new_ast));
     }
 
-    println!("renamed {} funcalls", renamed_count);
+    fn assert_rename_calls<'a>(path: &str,
+                               require_path: &str,
+                               module_name: &str,
+                               fn_name: &str,
+                               new_name: &str,
+                               before: &str,
+                               after: &str) {
+        let ast = full_moon::parse(before).unwrap();
+        let result = rename_fn_calls_in_file(&PathBuf::from(""), &PathBuf::from(path), ast, &require_path, &module_name, &fn_name, &new_name).unwrap();
+        assert_eq!(after, full_moon::print(&result.new_ast));
+    }
 
-    Ok(())
+    #[test]
+    fn rename_in_function() {
+        assert_rename_calls("api/Yeek.lua", "api.Rand", "Rand", "rnd", "asdfg",
+                            r#"
+local Rand = require("api.Rand")
+
+local Yeek = {}
+
+function Yeek.test()
+   local a = Rand.rnd(5)
+   local b = Rand.between(10, 20)
+   local c = Rand.rnd(30)
+   return a + b + c
+end
+
+return Yeek
+"#,
+                            r#"
+local Rand = require("api.Rand")
+
+local Yeek = {}
+
+function Yeek.test()
+   local a = Rand.asdfg(5)
+   local b = Rand.between(10, 20)
+   local c = Rand.asdfg(30)
+   return a + b + c
+end
+
+return Yeek
+"#
+        );
+    }
+
+    #[test]
+    fn rename_in_method() {
+        assert_rename_calls("api/Yeek.lua", "api.Rand", "Rand", "rnd", "asdfg",
+                            r#"
+local Rand = require("api.Rand")
+
+local Yeek = class.class("Yeek")
+
+function Yeek:test()
+   return Rand.rnd(5)
+end
+
+function Yeek.static_test()
+   return Rand.rnd(5)
+end
+
+return Yeek
+"#,
+                            r#"
+local Rand = require("api.Rand")
+
+local Yeek = class.class("Yeek")
+
+function Yeek:test()
+   return Rand.asdfg(5)
+end
+
+function Yeek.static_test()
+   return Rand.asdfg(5)
+end
+
+return Yeek
+"#
+        );
+    }
+
+    #[test]
+    fn rename_function_def() {
+        assert_rename_def("api/Rand.lua", "rnd", "asdfg",
+                          r#"
+local Rand = {}
+
+function Rand.rnd(n)
+    return rng:rnd(n)
+end
+
+function Rand.rnd_float()
+   return rng:rnd_float()
+end
+
+function Rand.one_in(n)
+   return Rand.rnd(n) == 0
+end
+
+return Rand
+"#,
+                          r#"
+local Rand = {}
+
+function Rand.asdfg(n)
+    return rng:rnd(n)
+end
+
+function Rand.rnd_float()
+   return rng:rnd_float()
+end
+
+function Rand.one_in(n)
+   return Rand.rnd(n) == 0
+end
+
+return Rand
+"#
+        );
+    }
 }

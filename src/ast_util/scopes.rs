@@ -23,18 +23,6 @@ impl ScopeManager {
         scope_visitor.scope_manager
     }
 
-    pub fn variable_at_byte(&self, byte: usize) -> Option<&Variable> {
-        for (_, variable) in &self.variables {
-            for range in &variable.identifiers {
-                if byte >= range.0 && byte <= range.1 {
-                    return Some(variable);
-                }
-            }
-        }
-
-        None
-    }
-
     pub fn reference_at_byte(&self, byte: usize) -> Option<&Reference> {
         for (_, reference) in &self.references {
             if byte >= reference.identifier.0 && byte <= reference.identifier.1 {
