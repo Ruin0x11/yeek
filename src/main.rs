@@ -9,9 +9,10 @@ use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Result};
 use clap::{Arg, App, SubCommand, ArgMatches, crate_version, crate_authors};
+use indicatif::ProgressBar;
 
-use full_moon::{ast, node::Node};
-use full_moon::tokenizer::{self, Token, TokenReference};
+use full_moon::node::Node;
+use full_moon::tokenizer::{Token, TokenReference};
 
 mod ast_util;
 mod context;
@@ -65,10 +66,7 @@ fn cmd_detect(sub_matches: &ArgMatches) -> Result<()> {
 
     let source = fs::read_to_string(input_file)?;
 
-    let tokens = tokenizer::tokens(&source)?;
-
-    let ast = ast::Ast::from_tokens(tokens)
-        .unwrap_or_else(|error| panic!("couldn't make ast for {:?} - {:?}", input_file, error));
+    let ast = full_moon::parse(&source).map_err(|e| anyhow!(format!("{}", e)))?;
 
     let old_positions: Vec<_> = ast.tokens().flat_map(unpack_token_reference).collect();
     let ast = ast.update_positions();
@@ -109,6 +107,10 @@ fn cmd_rename(sub_matches: &ArgMatches) -> Result<()> {
     let results = refactor::rename_function(&root, &input_file, &fn_name, &new_name)?;
     let mut renamed = 0;
 
+    println!("Performing renames...");
+
+    let pb = ProgressBar::new(results.len() as u64);
+
     for result in &results {
         for warning in &result.warnings {
             println!("{}", warning);
@@ -118,9 +120,11 @@ fn cmd_rename(sub_matches: &ArgMatches) -> Result<()> {
         if let Some(new_ast) = &result.new_ast {
             fs::write(&result.filepath, full_moon::print(&new_ast))?;
         }
+
+        pb.inc(1);
     }
 
-    println!("Renamed {} identifiers across {} files.", renamed, results.len());
+    pb.finish_with_message(&format!("Renamed {} identifiers across {} files.", renamed, results.len()));
 
     Ok(())
 }
@@ -130,12 +134,7 @@ fn cmd_dump(sub_matches: &ArgMatches) -> Result<()> {
 
     let source = fs::read_to_string(input_file)?;
 
-    let tokens = tokenizer::tokens(&source)?;
-
-    let ast = ast::Ast::from_tokens(tokens)
-        .unwrap_or_else(|error| panic!("couldn't make ast for {:?} - {:?}", input_file, error));
-
-    println!("{:#?}", ast);
+    println!("{:#?}", full_moon::parse(&source).map_err(|e| anyhow!(format!("{}", e)))?);
 
     Ok(())
 }

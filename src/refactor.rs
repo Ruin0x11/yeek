@@ -257,7 +257,6 @@ impl VisitorMut<'_> for RenameFnCallVisitor {
                             let byte_pos = pos.bytes();
                             if let Some(reference) = self.scopes.reference_at_byte(byte_pos) {
                                 if let Some(resolved_id) = reference.resolved {
-                                    let variable = &self.scopes.variables[resolved_id];
                                     self.referenced_variables.insert(resolved_id);
                                 }
                                 else {
@@ -394,7 +393,7 @@ pub fn rename_fn_def(path: &Path, ast: ast::Ast<'_>, fn_name: &str, new_name: &s
 }
 
 pub fn rename_function(root: &Path, path: &Path, fn_name: &str, new_name: &str) -> Result<Vec<RenameResult<'static>>> {
-    let mut it = WalkDir::new(root).follow_links(true).into_iter().filter_entry(is_lua_file).filter_map(|e| e.ok());
+    let it = WalkDir::new(root).follow_links(true).into_iter().filter_entry(is_lua_file).filter_map(|e| e.ok());
     let entries = it.collect::<Vec<_>>();
 
     let pb = ProgressBar::new(entries.len() as u64 + 1);
@@ -433,7 +432,7 @@ pub fn rename_function(root: &Path, path: &Path, fn_name: &str, new_name: &str) 
         result
     };
 
-    let results = entries.par_iter().map(process).try_fold(|| Vec::new(), |mut acc, i| {
+    let mut other_results = entries.par_iter().map(process).try_fold(|| Vec::new(), |mut acc, i| {
         match i {
             Ok(Some(r)) => { acc.push(r); Ok(acc) },
             Err(e) => Err(e),
@@ -442,6 +441,8 @@ pub fn rename_function(root: &Path, path: &Path, fn_name: &str, new_name: &str) 
     }).try_reduce(|| Vec::new(), |mut acc, mut i| {
         acc.append(&mut i); Ok(i)
     })?;
+
+    results.append(&mut other_results);
 
     pb.finish_with_message("");
 
