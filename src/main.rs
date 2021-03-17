@@ -4,6 +4,9 @@ extern crate full_moon;
 extern crate walkdir;
 extern crate indicatif;
 
+#[cfg(test)]
+#[macro_use] extern crate pretty_assertions;
+
 use std::fs;
 use std::borrow::Cow;
 use std::path::{Path, PathBuf};
@@ -20,6 +23,7 @@ mod context;
 mod detect;
 mod move_module;
 mod refactor;
+mod rename_module;
 mod util;
 
 fn get_app<'a, 'b>() -> App<'a, 'b> {
@@ -56,6 +60,16 @@ fn get_app<'a, 'b>() -> App<'a, 'b> {
                     .arg(Arg::with_name("NEW-DIR")
                          .required(true)
                          .help("New directory")
+                         .index(2)))
+        .subcommand(SubCommand::with_name("rename-module")
+                    .about("Renames an API, class, or interface module.")
+                    .arg(Arg::with_name("FILE")
+                         .required(true)
+                         .help("Lua file")
+                         .index(1))
+                    .arg(Arg::with_name("NEW-NAME")
+                         .required(true)
+                         .help("New name, must be alphanumeric-only")
                          .index(2)))
         .subcommand(SubCommand::with_name("dump")
                     .about("Prints the full_moon AST for a Lua source file.")
@@ -224,6 +238,68 @@ fn cmd_move(sub_matches: &ArgMatches) -> Result<()> {
     Ok(())
 }
 
+fn cmd_rename_module(sub_matches: &ArgMatches) -> Result<()> {
+    let input_file = Path::new(sub_matches.value_of("FILE").unwrap());
+    let new_name = sub_matches.value_of("NEW-NAME").unwrap();
+
+    if !input_file.is_file() {
+        return Err(anyhow!("Input file {:?} does not exist", input_file))
+    }
+
+    if !new_name.chars().all(char::is_alphanumeric) {
+        return Err(anyhow!("Name must consist only of alphanumeric characters."))
+    }
+
+    let new_path = input_file.with_file_name(new_name).with_extension("lua");
+
+    if new_path.is_file() {
+        return Err(anyhow!("New path {:?} already exists", new_path))
+    }
+
+    let root = get_root(input_file).ok_or(anyhow!("Could not find root"))?;
+
+    assert!(new_path.starts_with(&root));
+
+    println!("Updating require paths and identifiers...");
+
+    let results = rename_module::rename_module(&root, &input_file, &new_path)?;
+
+    println!("Writing code...");
+
+    let pb = ProgressBar::new(results.len() as u64);
+
+    let process = |result: &refactor::RenameResult<'_>| -> Result<()> {
+        if let Some(new_ast) = &result.new_ast {
+            fs::write(&result.filepath, full_moon::print(&new_ast))?;
+        }
+
+        pb.inc(1);
+
+        Ok(())
+    };
+
+    results.par_iter().try_for_each(process)?;
+    pb.finish_with_message("");
+
+    println!("Performing move...");
+
+    fs::copy(input_file, new_path)?;
+    fs::remove_file(input_file)?;
+
+    let mut updated = 0;
+    for result in &results {
+        updated += result.renamed_count;
+
+        for warning in &result.warnings {
+            println!("{}", warning);
+        }
+    }
+
+    println!("Updated {} require paths across {} files.", updated, results.len());
+
+    Ok(())
+}
+
 fn cmd_dump(sub_matches: &ArgMatches) -> Result<()> {
     let input_file = Path::new(sub_matches.value_of("FILE").unwrap());
 
@@ -241,6 +317,7 @@ fn main() -> Result<()> {
         ("detect", Some(sub_matches)) => cmd_detect(&sub_matches)?,
         ("rename", Some(sub_matches)) => cmd_rename(&sub_matches)?,
         ("move", Some(sub_matches)) => cmd_move(&sub_matches)?,
+        ("rename-module", Some(sub_matches)) => cmd_rename_module(&sub_matches)?,
         ("dump", Some(sub_matches)) => cmd_dump(&sub_matches)?,
         _ => get_app().print_long_help()?
     }

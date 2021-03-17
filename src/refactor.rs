@@ -179,7 +179,7 @@ fn make_new_var_expr<'a>(old_tok: &TokenCow<'a>, new_name: String, var_expr: ast
     ast::Var::Expression(new_var_expr)
 }
 
-fn extract_require_path<'ast>(expr: &ast::Expression<'ast>) -> Option<String> {
+pub fn extract_require_path<'ast>(expr: &ast::Expression<'ast>) -> Option<String> {
     if let ast::Expression::Value { value: ref val, .. } = expr {
         if let ast::Value::FunctionCall(funcall) = &**val {
             if let ast::Prefix::Name(name) = funcall.prefix() {
@@ -229,37 +229,34 @@ impl RenameFnCallVisitor {
 
 impl VisitorMut<'_> for RenameFnCallVisitor {
     fn visit_local_assignment<'ast>(&mut self, assign: ast::LocalAssignment<'ast>) -> ast::LocalAssignment<'ast> {
-        if let Some(expr) = assign.expr_list().iter().next() {
-            if let Some(name) = assign.name_list().iter().next() {
-                if name.token().to_string() == self.module_name {
-                    let req_path_opt = extract_require_path(&expr);
-                    let mut proceed = req_path_opt.map(|r| r == self.require_path).unwrap_or(false);
+        for (name, expr) in assign.name_list().iter().zip(assign.expr_list().iter()) {
+            if name.token().to_string() == self.module_name {
+                let req_path_opt = extract_require_path(&expr);
+                let mut proceed = req_path_opt.map(|r| r == self.require_path).unwrap_or(false);
 
-                    if !proceed {
-                        proceed = self.own_require_path == self.require_path
-                            && detect::detect_module_declaration_in_expr(&self.module_name, expr).is_some()
-                    }
+                if !proceed {
+                    proceed = self.own_require_path == self.require_path
+                        && detect::detect_module_declaration_in_expr(&self.module_name, expr).is_some()
+                }
 
-                    if proceed {
-                        if let Some(pos) = name.start_position() {
-                            let byte_pos = pos.bytes();
-                            if let Some(reference) = self.scopes.reference_at_byte(byte_pos) {
-                                if let Some(resolved_id) = reference.resolved {
-                                    self.referenced_variables.insert(resolved_id);
-                                }
-                                else {
-                                    self.warn(&assign, format!("could not find variable for module"));
-                                }
+                if proceed {
+                    if let Some(pos) = name.start_position() {
+                        let byte_pos = pos.bytes();
+                        if let Some(reference) = self.scopes.reference_at_byte(byte_pos) {
+                            if let Some(resolved_id) = reference.resolved {
+                                self.referenced_variables.insert(resolved_id);
                             }
                             else {
-                                self.warn(&assign, format!("could not find reference for module"));
+                                self.warn(&assign, format!("could not find variable for module"));
                             }
+                        }
+                        else {
+                            self.warn(&assign, format!("could not find reference for module"));
                         }
                     }
                 }
             }
         }
-
         assign
     }
 
@@ -343,8 +340,6 @@ pub struct RenameResult<'a> {
 }
 
 pub fn rename_fn_calls_in_file<'a>(root: &Path, path: &Path, ast: ast::Ast<'_>, require_path: &str, module_name: &str, fn_name: &str, new_name: &str) -> Result<RenameResult<'static>> {
-    let scope_manager = ScopeManager::new(&ast);
-
     let mut visitor = RenameFnCallVisitor {
         filepath: PathBuf::from(path),
         own_require_path: util::path_to_require_path(path, root).unwrap(),
@@ -352,15 +347,13 @@ pub fn rename_fn_calls_in_file<'a>(root: &Path, path: &Path, ast: ast::Ast<'_>, 
         module_name: module_name.to_string(),
         fn_name: fn_name.to_string(),
         new_name: new_name.to_string(),
-        scopes: scope_manager,
+        scopes: ScopeManager::new(&ast),
         referenced_variables: HashSet::new(),
         renamed_count: 0,
         warnings: Vec::new()
     };
 
     let new_ast = visitor.visit_ast(ast);
-
-    // println!("{}", full_moon::print(&new_ast));
 
     Ok(RenameResult { filepath: PathBuf::from(path), new_ast: Some(new_ast.owned()), renamed_count: visitor.renamed_count, warnings: visitor.warnings })
 }

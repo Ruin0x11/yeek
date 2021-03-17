@@ -48,3 +48,14 @@ pub fn is_lua_file(entry: &walkdir::DirEntry) -> bool {
          .map(|s| s.ends_with(".lua"))
          .unwrap_or(false)
 }
+
+#[cfg(test)]
+mod test {
+    use crate::util;
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_path_to_module_name() {
+        assert_eq!(&util::path_to_module_name(&PathBuf::from("src/api/Rand.lua")), "Rand");
+    }
+}

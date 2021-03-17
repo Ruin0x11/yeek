@@ -32,7 +32,7 @@ impl UpdateRequireCallVisitor {
 
 type ParenthesesArgs<'a> = Punctuated<'a, ast::Expression<'a>>;
 
-fn make_new_require_args<'a>(old_tok: &TokenCow<'a>, new_require_path: String, args: &ParenthesesArgs<'a>) -> ParenthesesArgs<'a> {
+pub fn make_new_require_args<'a>(old_tok: &TokenCow<'a>, new_require_path: String, args: &ParenthesesArgs<'a>) -> ParenthesesArgs<'a> {
     let quoted = format!("\"{}\"", new_require_path);
     let new_require_path = ast::Value::String(refactor::make_new_token(old_tok, quoted));
     let mut new_args = ParenthesesArgs::new();
