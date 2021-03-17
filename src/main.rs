@@ -89,8 +89,6 @@ fn cmd_detect(sub_matches: &ArgMatches) -> Result<()> {
 }
 
 fn get_root(input_file: &Path) -> Option<PathBuf> {
-    let mut new = input_file.clone();
-
     for parent in input_file.ancestors() {
         if parent.join(".git").is_dir() {
             return Some(parent.join("src/"))

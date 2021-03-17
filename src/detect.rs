@@ -159,17 +159,17 @@ fn is_empty_constructor_expression(expr: &ast::Expression) -> bool {
     false
 }
 
-fn detect_module_declaration_in_expr(ctxt: &Context, first_expr: &ast::Expression<'_>) -> Option<Module> {
+pub fn detect_module_declaration_in_expr(module_name: &str, first_expr: &ast::Expression<'_>) -> Option<Module> {
     if is_empty_constructor_expression(&first_expr) {
-        return Some(Module { name: ctxt.module_name.clone(), kind: ModuleKind::Api(ApiDef) })
+        return Some(Module { name: module_name.to_string(), kind: ModuleKind::Api(ApiDef) })
     }
 
     if let Some(class_module) = detect_class_module_declaration(&first_expr) {
-        return Some(Module { name: ctxt.module_name.clone(), kind: class_module })
+        return Some(Module { name: module_name.to_string(), kind: class_module })
     }
 
     if let Some(iface_module) = detect_interface_module_declaration(&first_expr) {
-        return Some(Module { name: ctxt.module_name.clone(), kind: iface_module })
+        return Some(Module { name: module_name.to_string(), kind: iface_module })
     }
 
     None
@@ -190,7 +190,7 @@ fn detect_module_declaration(ctxt: &Context, assign: &ast::LocalAssignment<'_>) 
         return None
     }
 
-    detect_module_declaration_in_expr(ctxt, &first_expr)
+    detect_module_declaration_in_expr(&ctxt.module_name, &first_expr)
 }
 
 fn find_module_declaration<'a, 'b>(ctxt: &Context, stmt: &'a ast::Stmt<'b>) -> Option<Module> {
@@ -261,7 +261,7 @@ impl ModuleDetectVisitor {
         if found.is_none() {
             if let Some(ast::LastStmt::Return(ret)) = last_stmt_opt {
                 if let Some(expr) = ret.returns().iter().next() {
-                    if let Some(module) = detect_module_declaration_in_expr(&self.ctxt, expr) {
+                    if let Some(module) = detect_module_declaration_in_expr(&self.ctxt.module_name, expr) {
                         found = Some(module.clone());
                     }
                 }

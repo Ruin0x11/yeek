@@ -1,14 +1,19 @@
 use full_moon::ast;
-use full_moon::tokenizer::{Token, TokenType, TokenReference};
+use full_moon::tokenizer::{Position, Token, TokenReference, TokenType};
 use full_moon::visitors::VisitorMut;
 use full_moon::ast::punctuated::{Punctuated, Pair};
+use full_moon::node::Node;
 
 use anyhow::{anyhow, Result};
 use walkdir::WalkDir;
 use std::borrow::Cow;
+use std::collections::HashSet;
+use std::fmt;
 use std::fs;
-use std::path::Path;
-use crate::ast_util::scopes::ScopeManager;
+use std::path::{Path, PathBuf};
+use id_arena::Id;
+use crate::ast_util::scopes::{Variable, ScopeManager};
+use crate::detect;
 
 #[derive(Debug, Clone, Copy)]
 enum FnKind {
@@ -23,6 +28,8 @@ fn path_to_require_path(path: &str) -> Option<String> {
         .strip_suffix(".lua")
         .map(|s| s.replace("/", "."))
         .map(|s| s.replace("\\", "."))
+        .map(|s| s.strip_suffix(".init").unwrap_or(&s).to_string())
+        .map(|s| s.trim_start_matches(".").to_string())
         .map(|s| s.to_string())
 }
 
@@ -49,7 +56,7 @@ fn is_module_fn_decl(decl: &ast::FunctionDeclaration, module_name: &str, fn_name
         let mod_name = iter.next().unwrap();
 
         if mod_name.token().to_string() == module_name {
-            return Some(FnKind::Function)
+            return Some(FnKind::Method)
         }
     } else {
         if names.len() != 2 {
@@ -119,34 +126,192 @@ impl VisitorMut<'_> for RenameFnDefVisitor {
     }
 }
 
+type Range = (Position, Position);
+
+#[derive(Debug)]
+struct Warning {
+    filepath: PathBuf,
+    range: Option<Range>,
+    message: String,
+}
+
+impl Warning {
+    fn new(filepath: PathBuf, node: &dyn Node, message: String) -> Self {
+        Warning {
+            filepath: filepath,
+            range: node.range(),
+            message: message
+        }
+    }
+
+    fn new_no_pos(filepath: PathBuf, message: String) -> Self {
+        Warning {
+            filepath: filepath,
+            range: None,
+            message: message
+        }
+    }
+}
+
+impl fmt::Display for Warning {
+    fn fmt(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+        let range = match self.range {
+            None => "".into(),
+            Some((start, _end)) => format!(":{}:{}", start.line(), start.character())
+        };
+        format!("{}{}: {}", self.filepath.to_str().unwrap(), range, self.message).fmt(formatter)
+    }
+}
+
 struct RenameFnCallVisitor {
+    filepath: PathBuf,
+    own_require_path: String,
     require_path: String,
     module_name: String,
     fn_name: String,
     new_name: String,
-    scopes: ScopeManager
+    scopes: ScopeManager,
+    referenced_variables: HashSet<Id<Variable>>,
+    renamed_count: u32,
+    warnings: Vec<Warning>
+}
+
+type TokenCow<'a> = Cow<'a, TokenReference<'a>>;
+
+fn make_new_funcall_expr<'a>(new_name: String, funcall: ast::FunctionCall<'a>, dot: TokenCow<'a>, binop: Option<ast::BinOpRhs<'a>>) -> ast::Expression<'a> {
+    let name_tok = Token::new(TokenType::Identifier { identifier: Cow::from(new_name) });
+    let new_name = Cow::Owned(TokenReference::new(Vec::new(), name_tok, Vec::new()));
+    let new_dot = ast::Index::Dot { dot: dot, name: new_name };
+    let new_suffix = ast::Suffix::Index(new_dot);
+    let mut new_suffixes = funcall.iter_suffixes().cloned().collect::<Vec<ast::Suffix>>();
+    new_suffixes[0] = new_suffix;
+    let new_funcall = funcall.with_suffixes(new_suffixes);
+    let new_value = ast::Value::FunctionCall(new_funcall);
+    ast::Expression::Value { value: Box::new(new_value), binop: binop }
+}
+
+static REQUIRE_FN_NAME: &str = "require";
+
+fn strip_quotes(mut string: String) -> String {
+    string.pop();
+    string.chars().skip(1).collect()
+}
+
+fn normalize_require_path(string: String) -> String {
+    string.strip_suffix(".init").unwrap_or(&string).to_string()
+}
+
+fn extract_require_path<'ast>(expr: &ast::Expression<'ast>) -> Option<String> {
+    if let ast::Expression::Value { value: ref val, .. } = expr {
+        if let ast::Value::FunctionCall(funcall) = &**val {
+            if let ast::Prefix::Name(name) = funcall.prefix() {
+                if name.token().to_string() == REQUIRE_FN_NAME {
+                    let mut suffixes = funcall.iter_suffixes();
+
+                    let first_suffix = suffixes.next();
+                    if let Some(ast::Suffix::Call(ast::Call::AnonymousCall(args))) = first_suffix {
+                        if let ast::FunctionArgs::Parentheses { arguments, .. } = args {
+                            let mut iter = arguments.iter();
+
+                            let first_arg = iter.next();
+                            if let Some(ast::Expression::Value { value: val, .. }) = first_arg {
+                                if let ast::Value::String(s) = &**val {
+                                    let raw = s.token().to_string();
+                                    return Some(normalize_require_path(strip_quotes(raw)));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+impl RenameFnCallVisitor {
+    fn warn(&mut self, node: &dyn Node, message: String) {
+        self.warnings.push(Warning::new(self.filepath.clone(), node, message));
+    }
 }
 
 impl VisitorMut<'_> for RenameFnCallVisitor {
+    fn visit_local_assignment<'ast>(&mut self, assign: ast::LocalAssignment<'ast>) -> ast::LocalAssignment<'ast> {
+        if let Some(expr) = assign.expr_list().iter().next() {
+            if let Some(name) = assign.name_list().iter().next() {
+                if name.token().to_string() == self.module_name {
+                    let req_path_opt = extract_require_path(&expr);
+                    let mut proceed = req_path_opt.map(|r| r == self.require_path).unwrap_or(false);
+
+                    if !proceed {
+                        proceed = self.own_require_path == self.require_path
+                            && detect::detect_module_declaration_in_expr(&self.module_name, expr).is_some()
+                    }
+
+                    if proceed {
+                        println!("proceed {:?}", name);
+                        if let Some(pos) = name.start_position() {
+                            let byte_pos = pos.bytes();
+                            if let Some(reference) = self.scopes.reference_at_byte(byte_pos) {
+                                if let Some(resolved_id) = reference.resolved {
+                                    let variable = &self.scopes.variables[resolved_id];
+                                    println!("def {:?} {:?}", variable, name);
+                                    self.referenced_variables.insert(resolved_id);
+                                }
+                                else {
+                                    self.warn(&assign, format!("could not find variable for module"));
+                                }
+                            }
+                            else {
+                                self.warn(&assign, format!("could not find reference for module"));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        assign
+    }
+
     fn visit_expression<'ast>(&mut self, expr: ast::Expression<'ast>) -> ast::Expression<'ast> {
         if let ast::Expression::Value { value: ref val, ref binop } = expr {
             if let ast::Value::FunctionCall(funcall) = &**val {
-                if let ast::Prefix::Name(name) = funcall.prefix() {
-                    if name.token().to_string() == self.module_name {
+                if let ast::Prefix::Name(module_name) = funcall.prefix() {
+                    if module_name.token().to_string() == self.module_name {
                         let mut suffixes = funcall.iter_suffixes();
-
                         let first_suffix = suffixes.next();
-                        if let Some(ast::Suffix::Index(ast::Index::Dot { dot, name })) = first_suffix {
-                            if name.token().to_string() == self.fn_name {
-                                let name_tok = Token::new(TokenType::Identifier { identifier: Cow::from(self.new_name.clone()) });
-                                let new_name = Cow::Owned(TokenReference::new(Vec::new(), name_tok, Vec::new()));
-                                let new_dot = ast::Index::Dot { dot: dot.clone(), name: new_name };
-                                let new_suffix = ast::Suffix::Index(new_dot);
-                                let mut new_suffixes = funcall.iter_suffixes().cloned().collect::<Vec<ast::Suffix>>();
-                                new_suffixes[0] = new_suffix;
-                                let new_funcall = funcall.clone().with_suffixes(new_suffixes);
-                                let new_value = ast::Value::FunctionCall(new_funcall);
-                                return ast::Expression::Value { value: Box::new(new_value), binop: binop.clone() }
+                        if let Some(ast::Suffix::Index(ast::Index::Dot { dot, name: fn_name })) = first_suffix {
+                            if fn_name.token().to_string() == self.fn_name {
+                                if let Some(pos) = module_name.start_position() {
+                                    let byte_pos = pos.bytes();
+                                    // println!("reference {:?} {}", module_name.range(), byte_pos);
+                                    for (i, r) in &self.scopes.references {
+                                        // println!("ref {:?} {:?}", i, r);
+                                    }
+                                    for (i, v) in &self.scopes.variables {
+                                        // println!("var {:?} {:?}", i, v);
+                                    }
+
+                                    if let Some(reference) = self.scopes.reference_at_byte(byte_pos) {
+                                        if let Some(resolved_id) = reference.resolved {
+                                            if self.referenced_variables.contains(&resolved_id) {
+                                                self.renamed_count += 1;
+                                                return make_new_funcall_expr(self.new_name.clone(), funcall.clone(), dot.clone(), binop.clone());
+                                            }
+                                            else {
+                                                self.warn(&expr, format!("could not find associated require for funcall stmt"));
+                                            }
+                                        }
+                                        else {
+                                            self.warn(&expr, format!("could not find variable for funcall stmt"));
+                                        }
+                                    }
+                                    else {
+                                        self.warn(&expr, format!("could not find reference for funcall stmt"));
+                                    }
+                                }
                             }
                         }
                     }
@@ -158,10 +323,16 @@ impl VisitorMut<'_> for RenameFnCallVisitor {
     }
 }
 
-pub fn rename_in_file(path: &Path, require_path: &str, module_name: &str, fn_name: &str, new_name: &str) -> Result<()> {
+#[derive(Debug)]
+struct RenameResult {
+    pub renamed_count: u32,
+    pub warnings: Vec<Warning>
+}
+
+fn rename_in_file(root: &Path, path: &Path, require_path: &str, module_name: &str, fn_name: &str, new_name: &str) -> Result<RenameResult> {
     let source = fs::read_to_string(path)?;
 
-    let mut ast: ast::Ast<'_> = full_moon::parse(&source).unwrap();
+    let ast: ast::Ast<'_> = full_moon::parse(&source).map_err(|e| anyhow!(format!("{}", e)))?;
 
     let scope_manager = ScopeManager::new(&ast);
 
@@ -170,18 +341,23 @@ pub fn rename_in_file(path: &Path, require_path: &str, module_name: &str, fn_nam
     // }
 
     let mut visitor = RenameFnCallVisitor {
+        filepath: PathBuf::from(path),
+        own_require_path: path_to_require_path(path.strip_prefix(root).unwrap().to_str().unwrap()).unwrap(),
         require_path: require_path.to_string(),
         module_name: module_name.to_string(),
         fn_name: fn_name.to_string(),
         new_name: new_name.to_string(),
-        scopes: scope_manager
+        scopes: scope_manager,
+        referenced_variables: HashSet::new(),
+        renamed_count: 0,
+        warnings: Vec::new()
     };
 
-    let new_ast = visitor.visit_ast(ast);
+    let _new_ast = visitor.visit_ast(ast);
 
-    println!("{}", full_moon::print(&new_ast));
+    // println!("{}", full_moon::print(&new_ast));
 
-    Ok(())
+    Ok(RenameResult { renamed_count: visitor.renamed_count, warnings: visitor.warnings })
 }
 
 fn is_lua_file(entry: &walkdir::DirEntry) -> bool {
@@ -198,7 +374,7 @@ fn is_lua_file(entry: &walkdir::DirEntry) -> bool {
 pub fn rename_function(root: &Path, path: &Path, fn_name: &str, new_name: &str) -> Result<()> {
     let source = fs::read_to_string(path)?;
 
-    let mut ast: ast::Ast<'_> = full_moon::parse(&source).unwrap();
+    let ast: ast::Ast<'_> = full_moon::parse(&source).unwrap();
 
     let module_name = path_to_module_name(path);
 
@@ -212,18 +388,35 @@ pub fn rename_function(root: &Path, path: &Path, fn_name: &str, new_name: &str) 
         new_name: new_name.to_string()
     };
 
-    let new_ast = rename_fn_visitor.visit_ast(ast);
+    let _new_ast = rename_fn_visitor.visit_ast(ast);
 
     // println!("{}", full_moon::print(&new_ast));
 
-    let require_path = path_to_require_path(path.to_str().unwrap()).unwrap();
+    let require_path = path_to_require_path(path.strip_prefix(root).unwrap().to_str().unwrap()).unwrap();
+
+    let mut renamed_count = 0;
+    let mut warnings = Vec::new();
 
     let walker = WalkDir::new(root).into_iter();
     for entry in walker.filter_entry(is_lua_file).filter_map(|e| e.ok()) {
+        println!("{:?}", entry.path());
         if entry.file_type().is_file() {
-            rename_in_file(entry.path(), &require_path, &module_name, &fn_name, &new_name)?;
+            match rename_in_file(&root, entry.path(), &require_path, &module_name, &fn_name, &new_name) {
+                Err(err) => warnings.push(Warning::new_no_pos(entry.path().into(), format!("Could not parse: {}", err))),
+                Ok(mut r) => {
+                    println!("{:?}", r);
+                    renamed_count += r.renamed_count;
+                    warnings.append(&mut r.warnings)
+                }
+            }
         }
     }
+
+    for warning in warnings.iter() {
+        println!("{}", warning);
+    }
+
+    println!("renamed {} funcalls", renamed_count);
 
     Ok(())
 }
