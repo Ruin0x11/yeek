@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{anyhow, Result};
 use clap::{Arg, App, SubCommand, ArgMatches, crate_version, crate_authors};
 use indicatif::ProgressBar;
+use rayon::prelude::*;
 
 use full_moon::node::Node;
 use full_moon::tokenizer::{Token, TokenReference};
@@ -105,26 +106,34 @@ fn cmd_rename(sub_matches: &ArgMatches) -> Result<()> {
     let root = get_root(input_file).ok_or(anyhow!("Could not find root"))?;
 
     let results = refactor::rename_function(&root, &input_file, &fn_name, &new_name)?;
-    let mut renamed = 0;
 
     println!("Performing renames...");
 
     let pb = ProgressBar::new(results.len() as u64);
 
-    for result in &results {
-        for warning in &result.warnings {
-            println!("{}", warning);
-        }
-        renamed += result.renamed_count;
-
+    let process = |result: &refactor::RenameResult<'_>| -> Result<()> {
         if let Some(new_ast) = &result.new_ast {
             fs::write(&result.filepath, full_moon::print(&new_ast))?;
         }
 
         pb.inc(1);
+
+        Ok(())
+    };
+
+    results.par_iter().try_for_each(process)?;
+    pb.finish_with_message("");
+
+    let mut renamed = 0;
+    for result in &results {
+        renamed += result.renamed_count;
+
+        for warning in &result.warnings {
+            println!("{}", warning);
+        }
     }
 
-    pb.finish_with_message(&format!("Renamed {} identifiers across {} files.", renamed, results.len()));
+    println!("Renamed {} identifiers across {} files.", renamed, results.len());
 
     Ok(())
 }

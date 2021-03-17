@@ -369,7 +369,7 @@ fn is_lua_file(entry: &walkdir::DirEntry) -> bool {
          .unwrap_or(false)
 }
 
-pub fn rename_fn_def(path: &Path, ast: ast::Ast<'_>, fn_name: &str, new_name: &str) -> Result<RenameResult<'static>> {
+pub fn rename_fn_def<'a>(path: &Path, ast: ast::Ast<'a>, fn_name: &str, new_name: &str) -> Result<ast::Ast<'a>> {
     let module_name = path_to_module_name(path);
 
     if find_fn_def_in_module_file(&ast, &module_name, &fn_name).is_none() {
@@ -383,28 +383,14 @@ pub fn rename_fn_def(path: &Path, ast: ast::Ast<'_>, fn_name: &str, new_name: &s
     };
 
     let new_ast = rename_fn_visitor.visit_ast(ast);
-
-    Ok(RenameResult {
-        filepath: PathBuf::from(path),
-        new_ast: Some(new_ast.owned()),
-        renamed_count: 0,
-        warnings: Vec::new()
-    })
+    Ok(new_ast)
 }
 
 pub fn rename_function(root: &Path, path: &Path, fn_name: &str, new_name: &str) -> Result<Vec<RenameResult<'static>>> {
     let it = WalkDir::new(root).follow_links(true).into_iter().filter_entry(is_lua_file).filter_map(|e| e.ok());
     let entries = it.collect::<Vec<_>>();
 
-    let pb = ProgressBar::new(entries.len() as u64 + 1);
-
-    let source = fs::read_to_string(path)?;
-    let ast: ast::Ast<'_> = full_moon::parse(&source).map_err(|e| anyhow!(format!("{}", e)))?;
-
-    let result = rename_fn_def(&path, ast, &fn_name, &new_name)?;
-    pb.inc(1);
-
-    let mut results = vec![result];
+    let pb = ProgressBar::new(entries.len() as u64);
 
     let module_name = path_to_module_name(path);
     let require_path = path_to_require_path(path.strip_prefix(root).unwrap().to_str().unwrap()).unwrap();
@@ -412,7 +398,11 @@ pub fn rename_function(root: &Path, path: &Path, fn_name: &str, new_name: &str) 
     let process = |entry: &walkdir::DirEntry| -> Result<Option<RenameResult<'static>>> {
         let result = if entry.file_type().is_file() {
             let source = fs::read_to_string(entry.path())?;
-            let ast: ast::Ast<'_> = full_moon::parse(&source).map_err(|e| anyhow!(format!("{}", e)))?;
+            let mut ast: ast::Ast<'_> = full_moon::parse(&source).map_err(|e| anyhow!(format!("{}", e)))?;
+
+            if entry.path() == path {
+                ast = rename_fn_def(&path, ast, &fn_name, &new_name)?;
+            }
 
             match rename_fn_calls_in_file(&root, entry.path(), ast, &require_path, &module_name, &fn_name, &new_name) {
                 Err(err) => {
@@ -432,17 +422,16 @@ pub fn rename_function(root: &Path, path: &Path, fn_name: &str, new_name: &str) 
         result
     };
 
-    let mut other_results = entries.par_iter().map(process).try_fold(|| Vec::new(), |mut acc, i| {
-        match i {
-            Ok(Some(r)) => { acc.push(r); Ok(acc) },
-            Err(e) => Err(e),
-            _ => Ok(acc)
-        }
-    }).try_reduce(|| Vec::new(), |mut acc, mut i| {
-        acc.append(&mut i); Ok(i)
-    })?;
-
-    results.append(&mut other_results);
+    let results = entries.par_iter().map(process)
+                                    .filter_map(|i| i.ok())
+                                    .fold(|| Vec::new(), |mut acc, i| {
+                                        if let Some(item) = i {
+                                            acc.push(item);
+                                        }
+                                        acc
+                                    }).reduce(|| Vec::new(), |mut acc, mut i| {
+                                        acc.append(&mut i); acc
+                                    });
 
     pb.finish_with_message("");
 
@@ -462,7 +451,7 @@ mod tests {
                              after: &str) {
         let ast = full_moon::parse(before).unwrap();
         let result = rename_fn_def(&PathBuf::from(path), ast, &fn_name, &new_name).unwrap();
-        assert_eq!(after, full_moon::print(&result.new_ast));
+        assert_eq!(after, full_moon::print(&result.new_ast.unwrap()));
     }
 
     fn assert_rename_calls<'a>(path: &str,
@@ -474,7 +463,7 @@ mod tests {
                                after: &str) {
         let ast = full_moon::parse(before).unwrap();
         let result = rename_fn_calls_in_file(&PathBuf::from(""), &PathBuf::from(path), ast, &require_path, &module_name, &fn_name, &new_name).unwrap();
-        assert_eq!(after, full_moon::print(&result.new_ast));
+        assert_eq!(after, full_moon::print(&result.new_ast.unwrap()));
     }
 
     #[test]
@@ -584,6 +573,39 @@ end
 
 return Rand
 "#
+        );
+    }
+
+    #[test]
+    fn rename_bare_assign() {
+        assert_rename_calls("api/Test.lua", "api.Rand", "Rand", "rnd", "asdfg",
+                            r#"
+local Rand = require("api.Rand")
+
+local Test = {}
+
+function Test.test()
+   local env = { Rand.rnd }
+   env["rnd"] = Rand.rnd
+   return env
+end
+
+return Test
+"#,
+                            r#"
+local Rand = require("api.Rand")
+
+local Test = {}
+
+function Test.test()
+   local env = { Rand.asdfg }
+   env["rnd"] = Rand.asdfg
+   return env
+end
+
+return Test
+"#,
+
         );
     }
 }
