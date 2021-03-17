@@ -2,6 +2,7 @@ extern crate anyhow;
 extern crate clap;
 extern crate full_moon;
 extern crate walkdir;
+extern crate indicatif;
 
 use std::fs;
 use std::borrow::Cow;
@@ -105,7 +106,21 @@ fn cmd_rename(sub_matches: &ArgMatches) -> Result<()> {
 
     let root = get_root(input_file).ok_or(anyhow!("Could not find root"))?;
 
-    refactor::rename_function(&root, &input_file, &fn_name, &new_name)?;
+    let results = refactor::rename_function(&root, &input_file, &fn_name, &new_name)?;
+    let mut renamed = 0;
+
+    for result in &results {
+        for warning in &result.warnings {
+            println!("{}", warning);
+        }
+        renamed += result.renamed_count;
+
+        if let Some(new_ast) = &result.new_ast {
+            fs::write(&result.filepath, full_moon::print(&new_ast))?;
+        }
+    }
+
+    println!("Renamed {} identifiers across {} files.", renamed, results.len());
 
     Ok(())
 }

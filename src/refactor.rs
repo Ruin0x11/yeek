@@ -13,6 +13,8 @@ use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use id_arena::Id;
+use indicatif::ProgressBar;
+use rayon::prelude::*;
 use crate::ast_util::scopes::{Variable, ScopeManager};
 use crate::detect;
 
@@ -256,7 +258,6 @@ impl VisitorMut<'_> for RenameFnCallVisitor {
                             if let Some(reference) = self.scopes.reference_at_byte(byte_pos) {
                                 if let Some(resolved_id) = reference.resolved {
                                     let variable = &self.scopes.variables[resolved_id];
-                                    println!("def {:?} {:?}", variable, name);
                                     self.referenced_variables.insert(resolved_id);
                                 }
                                 else {
@@ -318,7 +319,7 @@ impl VisitorMut<'_> for RenameFnCallVisitor {
 #[derive(Debug)]
 pub struct RenameResult<'a> {
     pub filepath: PathBuf,
-    pub new_ast: ast::Ast<'a>,
+    pub new_ast: Option<ast::Ast<'a>>,
     pub renamed_count: u32,
     pub warnings: Vec<Warning>
 }
@@ -347,10 +348,18 @@ pub fn rename_fn_calls_in_file<'a>(root: &Path, path: &Path, ast: ast::Ast<'_>, 
 
     // println!("{}", full_moon::print(&new_ast));
 
-    Ok(RenameResult { filepath: PathBuf::from(path), new_ast: new_ast.owned(), renamed_count: visitor.renamed_count, warnings: visitor.warnings })
+    Ok(RenameResult { filepath: PathBuf::from(path), new_ast: Some(new_ast.owned()), renamed_count: visitor.renamed_count, warnings: visitor.warnings })
+}
+
+fn is_useful_path(path: &Path) -> bool {
+    return !path.ends_with("src/thirdparty")
 }
 
 fn is_lua_file(entry: &walkdir::DirEntry) -> bool {
+    if !is_useful_path(entry.path()) {
+        return false
+    }
+
     if entry.file_type().is_dir() {
         return entry.file_name() != "locale"
     }
@@ -359,10 +368,6 @@ fn is_lua_file(entry: &walkdir::DirEntry) -> bool {
          .to_str()
          .map(|s| s.ends_with(".lua"))
          .unwrap_or(false)
-}
-
-fn is_useful_path(path: &Path) -> bool {
-    return !path.ends_with("src/thirdparty")
 }
 
 pub fn rename_fn_def(path: &Path, ast: ast::Ast<'_>, fn_name: &str, new_name: &str) -> Result<RenameResult<'static>> {
@@ -382,49 +387,63 @@ pub fn rename_fn_def(path: &Path, ast: ast::Ast<'_>, fn_name: &str, new_name: &s
 
     Ok(RenameResult {
         filepath: PathBuf::from(path),
-        new_ast: new_ast.owned(),
+        new_ast: Some(new_ast.owned()),
         renamed_count: 0,
         warnings: Vec::new()
     })
 }
 
 pub fn rename_function(root: &Path, path: &Path, fn_name: &str, new_name: &str) -> Result<Vec<RenameResult<'static>>> {
+    let mut it = WalkDir::new(root).follow_links(true).into_iter().filter_entry(is_lua_file).filter_map(|e| e.ok());
+    let entries = it.collect::<Vec<_>>();
+
+    let pb = ProgressBar::new(entries.len() as u64 + 1);
+
     let source = fs::read_to_string(path)?;
     let ast: ast::Ast<'_> = full_moon::parse(&source).map_err(|e| anyhow!(format!("{}", e)))?;
 
     let result = rename_fn_def(&path, ast, &fn_name, &new_name)?;
+    pb.inc(1);
 
     let mut results = vec![result];
 
     let module_name = path_to_module_name(path);
     let require_path = path_to_require_path(path.strip_prefix(root).unwrap().to_str().unwrap()).unwrap();
 
-    let mut renamed_count = 0;
-    let mut warnings = Vec::new();
-
-    let mut it = WalkDir::new(root).follow_links(true).into_iter().filter_entry(is_lua_file);
-    loop {
-        let entry = match it.next() {
-            None => break,
-            Some(Err(_)) => continue,
-            Some(Ok(entry)) => entry,
-        };
-
-        if !is_useful_path(entry.path()) {
-            it.skip_current_dir();
-            continue;
-        }
-
-        if entry.file_type().is_file() {
+    let process = |entry: &walkdir::DirEntry| -> Result<Option<RenameResult<'static>>> {
+        let result = if entry.file_type().is_file() {
             let source = fs::read_to_string(entry.path())?;
             let ast: ast::Ast<'_> = full_moon::parse(&source).map_err(|e| anyhow!(format!("{}", e)))?;
 
             match rename_fn_calls_in_file(&root, entry.path(), ast, &require_path, &module_name, &fn_name, &new_name) {
-                Err(err) => warnings.push(Warning::new_no_pos(entry.path().into(), format!("Could not parse: {}", err))),
-                Ok(r) => results.push(r)
+                Err(err) => {
+                    Ok(Some(RenameResult {
+                        filepath: entry.path().into(),
+                        new_ast: None,
+                        renamed_count: 0,
+                        warnings: vec![Warning::new_no_pos(entry.path().into(), format!("Could not parse: {}", err))]
+                    }))
+                },
+                Ok(r) => Ok(Some(r))
             }
+        } else {
+            Ok(None)
+        };
+        pb.inc(1);
+        result
+    };
+
+    let results = entries.par_iter().map(process).try_fold(|| Vec::new(), |mut acc, i| {
+        match i {
+            Ok(Some(r)) => { acc.push(r); Ok(acc) },
+            Err(e) => Err(e),
+            _ => Ok(acc)
         }
-    }
+    }).try_reduce(|| Vec::new(), |mut acc, mut i| {
+        acc.append(&mut i); Ok(i)
+    })?;
+
+    pb.finish_with_message("");
 
     Ok(results)
 }
