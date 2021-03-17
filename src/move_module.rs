@@ -110,8 +110,6 @@ pub fn update_require_calls_in_file<'a>(path: &Path, ast: ast::Ast<'_>, old_requ
 
     let new_ast = visitor.visit_ast(ast);
 
-    // println!("{}", full_moon::print(&new_ast));
-
     Ok(RenameResult { filepath: PathBuf::from(path), new_ast: Some(new_ast.owned()), renamed_count: visitor.renamed.len() as u32, warnings: visitor.warnings })
 }
 

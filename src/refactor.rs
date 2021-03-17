@@ -20,14 +20,12 @@ use crate::detect;
 use crate::util;
 
 #[derive(Debug, Clone, Copy)]
-enum FnKind {
+pub enum FnKind {
     Function,
     Method
 }
 
-fn is_module_fn_decl(decl: &ast::FunctionDeclaration, module_name: &str, fn_name: &str) -> Option<FnKind> {
-    let name = decl.name();
-
+pub fn is_module_fn_decl(name: &ast::FunctionName, module_name: &str, fn_name: &str) -> Option<FnKind> {
     let method_name = name.method_name();
     let is_method = method_name.is_some();
 
@@ -70,7 +68,7 @@ fn is_module_fn_decl(decl: &ast::FunctionDeclaration, module_name: &str, fn_name
 fn find_fn_def_in_module_file<'a, 'b>(ast: &'a ast::Ast<'b>, module_name: &str, fn_name: &str) -> Option<(&'a ast::FunctionDeclaration<'b>, FnKind)> {
     for stmt in ast.nodes().iter_stmts() {
         if let ast::Stmt::FunctionDeclaration(decl) = stmt {
-            if let Some(kind) = is_module_fn_decl(decl, module_name, fn_name) {
+            if let Some(kind) = is_module_fn_decl(decl.name(), module_name, fn_name) {
                 return Some((decl, kind))
             }
         }
@@ -85,7 +83,7 @@ struct RenameFnDefVisitor {
     new_name: String,
 }
 
-fn gen_fn_name<'ast>(module_name: String, fn_name: String, fn_kind: FnKind) -> ast::FunctionName<'ast> {
+pub fn make_new_fn_name<'ast>(module_name: String, fn_name: String, fn_kind: FnKind) -> ast::FunctionName<'ast> {
     let mut names = Punctuated::new();
 
     let sym = match fn_kind {
@@ -105,8 +103,8 @@ fn gen_fn_name<'ast>(module_name: String, fn_name: String, fn_kind: FnKind) -> a
 
 impl VisitorMut<'_> for RenameFnDefVisitor {
     fn visit_function_declaration<'ast>(&mut self, decl: ast::FunctionDeclaration<'ast>) -> ast::FunctionDeclaration<'ast> {
-        if let Some(fn_kind) = is_module_fn_decl(&decl, &self.module_name, &self.fn_name) {
-            let name = gen_fn_name(self.module_name.clone(), self.new_name.clone(), fn_kind);
+        if let Some(fn_kind) = is_module_fn_decl(&decl.name(), &self.module_name, &self.fn_name) {
+            let name = make_new_fn_name(self.module_name.clone(), self.new_name.clone(), fn_kind);
             decl.with_name(name)
         } else {
             decl

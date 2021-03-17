@@ -97,7 +97,6 @@ impl VisitorMut<'_> for RenameModuleVisitor {
                                             Some(punc) => Pair::Punctuated(new_name, Cow::Owned(punc.clone())),
                                             None => Pair::End(new_name),
                                         };
-                                        println!("get {:?}", new_name_pair);
                                         new_names.push(new_name_pair);
                                         found = true;
                                     }
@@ -127,24 +126,22 @@ impl VisitorMut<'_> for RenameModuleVisitor {
 
     fn visit_prefix<'ast>(&mut self, prefix: ast::Prefix<'ast>) -> ast::Prefix<'ast> {
         if let ast::Prefix::Name(ref module_name) = prefix {
-            if let Some(pos) = module_name.start_position() {
-                let bytes = pos.bytes();
-                if let Some(reference) = self.scopes.reference_at_byte(bytes) {
-                    if let Some(resolved_id) = reference.resolved {
-                        if self.referenced_variables.contains(&resolved_id) {
-                            self.renamed.insert(bytes);
-                            return make_new_prefix_name(module_name, self.new_module_name.clone());
+            let string = module_name.token().to_string();
+            if string == self.old_module_name {
+                if let Some(pos) = module_name.start_position() {
+                    let bytes = pos.bytes();
+                    if let Some(reference) = self.scopes.reference_at_byte(bytes) {
+                        if let Some(resolved_id) = reference.resolved {
+                            if self.referenced_variables.contains(&resolved_id) {
+                                self.renamed.insert(bytes);
+                                return make_new_prefix_name(module_name, self.new_module_name.clone());
+                            }
                         }
                     }
                 }
-                if !self.renamed.contains(&bytes) {
-                    let string = module_name.token().to_string();
-                    if string == self.old_module_name {
-                        self.warn(&prefix, format!("Found identifier matching old module name"));
-                    } else if string == self.new_module_name {
-                        self.warn(&prefix, format!("Found identifier matching new module name"));
-                    }
-                }
+                self.warn(&prefix, format!("Found identifier matching old module name"));
+            } else if string == self.new_module_name {
+                self.warn(&prefix, format!("Found identifier matching new module name"));
             }
         }
         prefix
@@ -198,16 +195,46 @@ impl VisitorMut<'_> for RenameModuleVisitor {
         val
     }
 
-    fn visit_function_call<'ast>(&mut self, funcall: ast::FunctionCall<'ast>) -> ast::FunctionCall<'ast> {
-        if let ast::Prefix::Name(module_name) = funcall.prefix() {
-            if module_name.token().to_string() == self.old_module_name {
-                if let Some(pos) = module_name.start_position() {
-                    let bytes = pos.bytes();
-                    if !self.renamed.contains(&bytes) {
-                        self.warn(&funcall, format!("Found identifier that looks similar to old module name"));
+    fn visit_function_name<'ast>(&mut self, name: ast::FunctionName<'ast>) -> ast::FunctionName<'ast> {
+        if let Some(mod_name) = name.names().iter().next() {
+            let string = mod_name.token().to_string();
+            if string == self.old_module_name {
+                if let Some(pos) = mod_name.start_position() {
+                    let byte_pos = pos.bytes();
+                    if let Some(reference) = self.scopes.reference_at_byte(byte_pos) {
+                        if let Some(resolved_id) = reference.resolved {
+                            if self.referenced_variables.contains(&resolved_id) {
+                                let mut new_names = Punctuated::new();
+
+                                let pair = name.names().pairs().next().unwrap();
+                                let module_tok = refactor::make_new_token(pair.value(), self.new_module_name.clone());
+
+                                match pair.punctuation() {
+                                    Some(p) => new_names.push(Pair::Punctuated(module_tok, Cow::Owned(p.clone()))),
+                                    None => new_names.push(Pair::End(module_tok))
+                                }
+
+                                for pair in name.names().pairs().skip(1) {
+                                    new_names.push(pair.clone());
+                                }
+
+                                return name.clone().with_names(new_names)
+                            }
+                        }
                     }
                 }
-            } else if module_name.token().to_string() == util::REQUIRE_FN_NAME {
+                self.warn(&name, "Found function name matching old module name".to_string());
+            } else if string == self.new_module_name {
+                self.warn(&name, "Found function name matching new module name".to_string());
+            }
+        }
+
+        name
+    }
+
+    fn visit_function_call<'ast>(&mut self, funcall: ast::FunctionCall<'ast>) -> ast::FunctionCall<'ast> {
+        if let ast::Prefix::Name(module_name) = funcall.prefix() {
+            if module_name.token().to_string() == util::REQUIRE_FN_NAME {
                 let mut suffixes = funcall.iter_suffixes();
 
                 let first_suffix = suffixes.next();
@@ -357,21 +384,33 @@ mod tests {
         assert_update_require("src/api/test.lua", "src/api/Rand.lua", "Dood",
                               r#"
 local Rand = require("api.Rand")
+
+Rand.rnd(2)
+Rand.rnd.rnd(2)
 "#,
                               r#"
 local Dood = require("api.Dood")
+
+Dood.rnd(2)
+Dood.rnd.rnd(2)
 "#
         );
     }
 
     #[test]
     fn updates_require_path_without_ident() {
-        assert_update_require("src/api/test.lua", "src/api/Rand.lua", "Dood",
+        assert_update_require("src/api/Test.lua", "src/api/Rand.lua", "Dood",
                               r#"
-local Dood = require("api.Rand")
+local Test = require("api.Rand")
+
+Test.rnd(2)
+Test.rnd.rnd(2)
 "#,
                               r#"
-local Dood = require("api.Dood")
+local Test = require("api.Dood")
+
+Test.rnd(2)
+Test.rnd.rnd(2)
 "#
         );
     }
@@ -434,13 +473,85 @@ return Test
                               r#"
 local Rand = {}
 
+function Rand.rnd(n)
+   return rng:rnd(n)
+end
+
+function Rand.one_in(n)
+   return Rand.rnd(n) == 0
+end
+
+Rand.NUM = 10
+
 return Rand
 "#,
                               r#"
 local Dood = {}
 
+function Dood.rnd(n)
+   return rng:rnd(n)
+end
+
+function Dood.one_in(n)
+   return Dood.rnd(n) == 0
+end
+
+Dood.NUM = 10
+
 return Dood
 "#
+        );
+    }
+
+    #[test]
+    fn updates_module_name_in_class_def() {
+        assert_update_require("src/api/Test.lua", "src/api/Test.lua", "Dood",
+                              r#"
+local Test = class.class("Test")
+
+function Test:test(n)
+   return Test:test(n)
+end
+
+function Test.static_test(n)
+   return Test.static_test(n)
+end
+
+return Test
+"#,
+                              r#"
+local Dood = class.class("Test")
+
+function Dood:test(n)
+   return Dood:test(n)
+end
+
+function Dood.static_test(n)
+   return Dood.static_test(n)
+end
+
+return Dood
+"#
+        );
+    }
+
+    #[test]
+    fn updates_function_module() {
+        assert_update_require("src/api/Test.lua", "src/api/Test.lua", "Dood",
+                              r#"
+local Test = {}
+
+Test()
+
+return Test
+"#,
+                              r#"
+local Dood = {}
+
+Dood()
+
+return Dood
+"#,
         );
     }
 
@@ -544,6 +655,35 @@ local api = "Rand"
 local api = "Dood"
 "#,
                      "Found string constant matching new module name"
+        );
+    }
+
+    #[test]
+    fn warns_about_function_decl() {
+        assert_warns("src/api/test.lua", "src/api/Rand.lua", "Dood",
+                     r#"
+local Rand = {}
+
+function Rand.rnd(n)
+   return rng:rnd(n)
+end
+
+return Rand
+"#,
+                     "Found local assignment matching old module name"
+        );
+
+        assert_warns("src/api/test.lua", "src/api/Rand.lua", "Dood",
+                     r#"
+local Dood = {}
+
+function Dood.rnd(n)
+   return rng:rnd(n)
+end
+
+return Dood
+"#,
+                     "Found local assignment matching new module name"
         );
     }
 }
